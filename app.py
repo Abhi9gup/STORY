@@ -415,23 +415,33 @@ def get_available_voices():
         return dict(FALLBACK_VOICE_OPTIONS)
 
     wanted_locales = {"hi-IN", "en-IN"}
-    filtered = [v for v in all_voices if v.get("Locale") in wanted_locales]
+    filtered = [
+        v for v in all_voices
+        if v.get("Locale") in wanted_locales or "Multilingual" in v.get("ShortName", "")
+    ]
     if not filtered:
         return dict(FALLBACK_VOICE_OPTIONS)
 
-    # Hindi voices first (most relevant here), then English-India.
-    filtered.sort(key=lambda v: (v["Locale"] != "hi-IN", v.get("Gender", ""), v["ShortName"]))
+    # Hindi-native voices first, then Multilingual (also speak Hindi text,
+    # just not hi-IN native), then plain en-IN.
+    def _sort_key(v):
+        is_hindi_native = v["Locale"] != "hi-IN"
+        is_multilingual = "Multilingual" not in v["ShortName"]
+        return (is_hindi_native, is_multilingual, v.get("Gender", ""), v["ShortName"])
+
+    filtered.sort(key=_sort_key)
 
     options = {}
     for v in filtered:
         short_name = v["ShortName"]                      # e.g. hi-IN-MadhurNeural
-        persona = short_name.split("-")[-1].replace("Neural", "")
-        lang_label = "Hindi" if v["Locale"] == "hi-IN" else "English-India"
+        persona = short_name.split("-")[-1].replace("Neural", "").replace("Multilingual", "")
+        if v["Locale"] == "hi-IN":
+            lang_label = "Hindi"
+        elif "Multilingual" in short_name:
+            lang_label = "Multilingual — speaks Hindi"
+        else:
+            lang_label = "English-India"
         label = f"{v.get('Gender', '')} ({lang_label}) — {persona}"
-        # Surface a few known "expressive" style tags if edge-tts reports them.
-        styles = v.get("VoiceTag", {}).get("VoicePersonalities") if isinstance(v.get("VoiceTag"), dict) else None
-        if styles:
-            label += f" [{', '.join(styles[:2])}]"
         options[label] = short_name
 
     return options or dict(FALLBACK_VOICE_OPTIONS)
@@ -444,8 +454,16 @@ def setup_workspace():
     os.makedirs(TEMP_DIR, exist_ok=True)
 
 
-def save_uploaded_image(uploaded_file):
-    """Persist a single uploaded image to the temp workspace and return its path."""
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+
+
+def is_video_file(path_or_name: str) -> bool:
+    return os.path.splitext(path_or_name)[1].lower() in VIDEO_EXTENSIONS
+
+
+def save_uploaded_media(uploaded_file):
+    """Persist a single uploaded image OR video to the temp workspace and
+    return its path."""
     file_path = os.path.join(TEMP_DIR, uploaded_file.name)
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -624,6 +642,28 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
             duration = audio_clip.duration
             segment_clip = None
 
+            if is_video_file(image_path):
+                # User uploaded an actual video clip for this scene — use it
+                # as-is (looped or trimmed to match the narration length)
+                # instead of any Ken Burns / AI motion treatment.
+                raw_clip = VideoFileClip(image_path)
+                image_clips_to_close.append(raw_clip)
+                source_clip = raw_clip
+                if raw_clip.duration < duration:
+                    loops_needed = int(duration // raw_clip.duration) + 1
+                    looped_clip = concatenate_videoclips([raw_clip] * loops_needed, method="compose")
+                    image_clips_to_close.append(looped_clip)
+                    source_clip = looped_clip
+                segment_clip = _subclip(source_clip, 0, duration)
+                segment_clip = _with_audio(segment_clip, audio_clip)
+                image_clips_to_close.append(segment_clip)
+                video_segments.append(segment_clip)
+                if progress_callback:
+                    progress_callback(
+                        (index + 1) / total, f"Assembling video segment {index + 1}/{total}..."
+                    )
+                continue
+
             if motion_effect == "ai_motion":
                 try:
                     if progress_callback:
@@ -775,11 +815,12 @@ def main():
 
     st.divider()
 
-    # ---------------- Step 1: Upload Images ----------------
-    st.subheader("1️⃣ Upload Your Pictures")
+    # ---------------- Step 1: Upload Images or Video Clips ----------------
+    st.subheader("1️⃣ Upload Your Pictures or Video Clips")
+    st.caption("Mix and match — each scene can be a still photo OR a short video clip.")
     uploaded_images = st.file_uploader(
-        "Upload images (order below = order in the video)",
-        type=["jpg", "jpeg", "png"],
+        "Upload images/videos (order below = order in the video)",
+        type=["jpg", "jpeg", "png", "mp4", "mov", "m4v", "webm"],
         accept_multiple_files=True,
     )
 
@@ -872,22 +913,41 @@ def main():
                 for i, chunk in enumerate(chunks[: len(uploaded_images)]):
                     st.session_state[f"story_text_{i}"] = chunk
 
-        # One row per image: thumbnail + its own text area, voice, style, and
-        # a live preview of any sound cues auto-detected in that scene's text.
+        VOICE_STYLE_PRESETS = {
+            "Natural (no change)": (0, 0),
+            "Deep & Slow (serious/dramatic)": (-20, -15),
+            "Young & Energetic": (15, 10),
+            "Warm & Soft": (-10, 5),
+            "Bright & Fast (excited)": (15, 15),
+        }
+
+        def _apply_voice_preset(scene_index):
+            preset_name = st.session_state.get(f"scene_style_preset_{scene_index}")
+            if preset_name in VOICE_STYLE_PRESETS:
+                rate, pitch = VOICE_STYLE_PRESETS[preset_name]
+                st.session_state[f"scene_rate_{scene_index}"] = rate
+                st.session_state[f"scene_pitch_{scene_index}"] = pitch
+
+        # One row per scene: thumbnail/video preview + its own text area, voice,
+        # style, and a live preview of any sound cues auto-detected in the text.
         for index, uploaded_file in enumerate(uploaded_images):
             col1, col2 = st.columns([1, 2])
             with col1:
-                st.image(uploaded_file, caption=uploaded_file.name, use_container_width=True)
+                if is_video_file(uploaded_file.name):
+                    st.video(uploaded_file)
+                    st.caption(f"🎬 {uploaded_file.name} (video clip)")
+                else:
+                    st.image(uploaded_file, caption=uploaded_file.name, use_container_width=True)
             with col2:
                 st.text_area(
-                    f"Story text for picture {index + 1}",
+                    f"Story text for scene {index + 1}",
                     key=f"story_text_{index}",
                     height=120,
-                    placeholder="Write or paste the sentence that goes with this picture...",
+                    placeholder="Write or paste the sentence that goes with this scene...",
                 )
 
                 scene_voice_label = st.selectbox(
-                    f"Voice for picture {index + 1}",
+                    f"Voice for scene {index + 1}",
                     options=voice_labels,
                     index=default_voice_index,
                     key=f"scene_voice_label_{index}",
@@ -895,6 +955,13 @@ def main():
 
                 with st.expander("🎙️ Fine-tune expressiveness (optional)"):
                     st.caption("Push rate/pitch for a more animated, 'vocal' delivery on dramatic lines.")
+                    st.selectbox(
+                        "Style preset",
+                        options=list(VOICE_STYLE_PRESETS.keys()),
+                        key=f"scene_style_preset_{index}",
+                        on_change=_apply_voice_preset,
+                        args=(index,),
+                    )
                     st.slider("Speaking rate", -50, 50, 0, step=5, key=f"scene_rate_{index}",
                                help="Negative = slower/more dramatic, positive = faster/more excited")
                     st.slider("Pitch", -50, 50, 0, step=5, key=f"scene_pitch_{index}",
@@ -917,7 +984,10 @@ def main():
             st.divider()
 
     st.subheader("5️⃣ Motion Effect")
-    st.caption("Adds motion to each picture so the video feels alive instead of a static slideshow.")
+    st.caption(
+        "Applies to picture scenes only — video-clip scenes already have their own motion "
+        "and are used as-is."
+    )
     motion_choice = st.selectbox(
         "Motion style",
         options=[
@@ -981,6 +1051,8 @@ def main():
             )
             if uploaded_images:
                 for index, uploaded_file in enumerate(uploaded_images):
+                    if is_video_file(uploaded_file.name):
+                        continue  # already a video clip — AI motion doesn't apply
                     motion_prompts[index] = st.text_input(
                         f"Motion for picture {index + 1} ({uploaded_file.name})",
                         key=f"motion_prompt_{index}",
@@ -1022,7 +1094,7 @@ def main():
                 scene_voices = []
                 scene_styles = []
                 for index, uploaded_file in enumerate(uploaded_images):
-                    image_path = save_uploaded_image(uploaded_file)
+                    image_path = save_uploaded_media(uploaded_file)
                     text = st.session_state[f"story_text_{index}"].strip()
                     story_items.append((image_path, text))
 
