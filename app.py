@@ -14,6 +14,7 @@ Dependencies:
 """
 
 import os
+import re
 import shutil
 import random
 import asyncio
@@ -48,7 +49,9 @@ try:
         AudioFileClip,
         VideoFileClip,
         CompositeVideoClip,
+        CompositeAudioClip,
         concatenate_videoclips,
+        concatenate_audioclips,
     )
 except ModuleNotFoundError:
     from moviepy import (
@@ -56,7 +59,9 @@ except ModuleNotFoundError:
         AudioFileClip,
         VideoFileClip,
         CompositeVideoClip,
+        CompositeAudioClip,
         concatenate_videoclips,
+        concatenate_audioclips,
     )
 
 # MoviePy 2.x renamed several clip methods (set_duration -> with_duration,
@@ -86,6 +91,27 @@ def _positioned(clip, pos):
     if hasattr(clip, "with_position"):
         return clip.with_position(pos)
     return clip.set_position(pos)
+
+
+def _with_start(clip, start_time):
+    """with_start() on MoviePy 2.x, set_start() on 1.x."""
+    if hasattr(clip, "with_start"):
+        return clip.with_start(start_time)
+    return clip.set_start(start_time)
+
+
+def _with_volume(clip, factor):
+    """with_volume_scaled() on MoviePy 2.x, volumex() on 1.x."""
+    if hasattr(clip, "with_volume_scaled"):
+        return clip.with_volume_scaled(factor)
+    return clip.volumex(factor)
+
+
+def _subclip(clip, start, end):
+    """subclipped() on MoviePy 2.x, subclip() on 1.x."""
+    if hasattr(clip, "subclipped"):
+        return clip.subclipped(start, end)
+    return clip.subclip(start, end)
 
 
 KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
@@ -235,17 +261,142 @@ def generate_ai_motion_clip(image_path: str, audio_path: str, motion_prompt: str
 TEMP_DIR = "temp_assets"
 OUTPUT_FILENAME = "final_output.mp4"
 
-VOICE_OPTIONS = {
+# Fallback list used only if the live edge-tts voice catalog can't be fetched
+# (e.g. no internet at import time). get_available_voices() below normally
+# replaces this with the full, current set of Hindi + English-India voices.
+FALLBACK_VOICE_OPTIONS = {
     "Male (English-India)": "en-IN-PrabhatNeural",
     "Female (English-India)": "en-IN-NeerjaNeural",
     "Male (Hindi)": "hi-IN-MadhurNeural",
     "Female (Hindi)": "hi-IN-SwaraNeural",
 }
 
+# --------------------------------------------------------------------------
+# Sound library (SFX / BGM) — auto-detected from the story text
+# --------------------------------------------------------------------------
+# Drop your own audio files here (they are NOT wiped between runs, unlike
+# temp_assets/):
+#   sound_library/sfx/<name>.mp3   e.g. sound_library/sfx/laugh.mp3
+#   sound_library/bgm/<name>.mp3   e.g. sound_library/bgm/love.mp3
+# Supported extensions: .mp3 .wav .ogg .m4a
+# The <name> must match the tag after the colon, e.g. "[sfx:laugh]" -> laugh.*
+SOUND_LIBRARY_DIR = "sound_library"
+SFX_DIR = os.path.join(SOUND_LIBRARY_DIR, "sfx")
+BGM_DIR = os.path.join(SOUND_LIBRARY_DIR, "bgm")
+SOUND_FILE_EXTENSIONS = (".mp3", ".wav", ".ogg", ".m4a")
+
+# How SFX vs BGM cues behave once detected in the text:
+SFX_MAX_SECONDS = 4          # one-shot stings are trimmed to this length
+BGM_VOLUME = 0.22            # BGM plays quietly under the narration
+SFX_VOLUME = 0.9             # SFX plays near-full volume as a short accent
+
+# Hindi/Hinglish keyword -> sound-cue tag map. Edit/extend this freely —
+# every pattern is matched (case-sensitive Devanagari) against each scene's
+# story text, and any hit auto-inserts the matching sound at that point.
+SOUND_KEYWORD_MAP = {
+    # --- पुराने साउंड्स ---
+    r"(हंसने|हंसा|मजाक|ठिठोली|खिलखिला)": "[sfx:laugh]",
+    r"(सांप|नाग|नागिन|फुंकार|डसने)": "[sfx:hiss]",
+    r"(बिजली|तूफान|बादल|गर्जना|कड़क)": "[sfx:thunder]",
+    r"(अचानक|चौंक|तभी|एकदम|पलक झपकते)": "[sfx:whoosh]",
+    r"(हवा|सन्नाटा|अंधेरा|जंगल|शमशान)": "[sfx:wind]",
+    r"(सोचा|बुद्धि|विचार|आइडिया|तरकीब)": "[sfx:ding]",
+
+    # --- नए साउंड्स (SFX) ---
+    r"(रोने|रोया|आंसू|सिसकने|विलाप|रोना)": "[sfx:crying]",
+    r"(डर|कांप|सहमा|खौफ|भयानक|भूत)": "[sfx:fear]",
+    r"(हांफने|हांफा|सांस फूल|थक)": "[sfx:panting]",
+    r"(शेर|दहाड़|सिंह|वनराज)": "[sfx:lion_roar]",
+    r"(कुत्ता|भोंकने|भौ-भौ|श्वान)": "[sfx:dog_bark]",
+    r"(बिल्ली|म्याऊ|म्यॉंऊ)": "[sfx:cat_meow]",
+    r"(भेड़िया|हुआँ|चीख)": "[sfx:wolf_howl]",
+    r"(दर्द|कराहा|चोट|आह|उफ्)": "[sfx:pain_groan]",
+
+    # --- म्यूजिक ट्रैक्स (BGM) ---
+    r"(प्यार|मोहब्बत|सुंदर|रूप|खूबसूरत|रोमांटिक)": "[bgm:love]",
+    r"(भगवान|शिव|मंदिर|पूजा|प्रार्थना|भक्ति|आशीर्वाद)": "[bgm:devotional]",
+    r"(रहस्य|राज|सस्पेंस|छुपा|खोज)": "[bgm:suspense]",
+}
+
+
+def _parse_sound_tag(tag_str: str):
+    """'[sfx:laugh]' -> ('sfx', 'laugh')"""
+    m = re.match(r"\[(sfx|bgm):(\w+)\]", tag_str)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def find_sound_cues(text: str):
+    """Scan story text for every keyword match and return the cues found,
+    sorted by where they occur in the text. Each cue is a dict with the
+    matched phrase, its character position, and the sfx/bgm tag it maps to.
+    Detection only — does not check whether an audio file exists yet."""
+    cues = []
+    for pattern, tag in SOUND_KEYWORD_MAP.items():
+        kind, name = _parse_sound_tag(tag)
+        if not kind:
+            continue
+        for m in re.finditer(pattern, text):
+            cues.append({
+                "start": m.start(),
+                "match": m.group(0),
+                "kind": kind,
+                "name": name,
+                "tag": tag,
+            })
+    cues.sort(key=lambda c: c["start"])
+    return cues
+
+
+def sound_file_path(kind: str, name: str):
+    """Look up an actual audio file in sound_library/ for a given cue. Returns
+    None if the user hasn't dropped that file in yet (caller should skip it,
+    not crash)."""
+    folder = SFX_DIR if kind == "sfx" else BGM_DIR
+    for ext in SOUND_FILE_EXTENSIONS:
+        candidate = os.path.join(folder, name + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
 
 # --------------------------------------------------------------------------
 # Helper Functions
 # --------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def get_available_voices():
+    """Fetch the live edge-tts voice catalog and return every Hindi and
+    English-India voice as {friendly label: voice_id}. This picks up new
+    Hindi voices Microsoft adds over time instead of relying on a hardcoded
+    list. Falls back to a small hardcoded set if the catalog can't be
+    fetched (e.g. no network)."""
+    try:
+        all_voices = asyncio.run(edge_tts.list_voices())
+    except Exception:
+        return dict(FALLBACK_VOICE_OPTIONS)
+
+    wanted_locales = {"hi-IN", "en-IN"}
+    filtered = [v for v in all_voices if v.get("Locale") in wanted_locales]
+    if not filtered:
+        return dict(FALLBACK_VOICE_OPTIONS)
+
+    # Hindi voices first (most relevant here), then English-India.
+    filtered.sort(key=lambda v: (v["Locale"] != "hi-IN", v.get("Gender", ""), v["ShortName"]))
+
+    options = {}
+    for v in filtered:
+        short_name = v["ShortName"]                      # e.g. hi-IN-MadhurNeural
+        persona = short_name.split("-")[-1].replace("Neural", "")
+        lang_label = "Hindi" if v["Locale"] == "hi-IN" else "English-India"
+        label = f"{v.get('Gender', '')} ({lang_label}) — {persona}"
+        # Surface a few known "expressive" style tags if edge-tts reports them.
+        styles = v.get("VoiceTag", {}).get("VoicePersonalities") if isinstance(v.get("VoiceTag"), dict) else None
+        if styles:
+            label += f" [{', '.join(styles[:2])}]"
+        options[label] = short_name
+
+    return options or dict(FALLBACK_VOICE_OPTIONS)
+
+
 def setup_workspace():
     """Create a fresh temp_assets directory, wiping any previous run."""
     if os.path.exists(TEMP_DIR):
@@ -261,26 +412,149 @@ def save_uploaded_image(uploaded_file):
     return file_path
 
 
-async def generate_audio_file(text: str, voice: str, output_path: str):
-    """Generate a single TTS audio file asynchronously using edge-tts."""
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(output_path)
+async def generate_audio_file(text: str, voice: str, output_path: str,
+                               rate: str = "+0%", pitch: str = "+0Hz"):
+    """Generate a single TTS audio file asynchronously using edge-tts and
+    return the word-boundary timing list edge-tts reports along the way
+    (used to line up SFX/BGM cues with the moment the trigger word is
+    actually spoken, instead of guessing by character position)."""
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+    boundaries = []
+    with open(output_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                boundaries.append({
+                    "audio_time": chunk["offset"] / 10_000_000,   # 100ns -> seconds
+                    "duration": chunk["duration"] / 10_000_000,
+                    "text": chunk["text"],
+                })
+    return boundaries
 
 
-async def generate_all_audio(story_items, voice: str, progress_callback=None):
+def _align_cues_to_audio(text: str, boundaries: list, cues: list):
+    """Turn each cue's character position in the story text into an actual
+    timestamp in the generated narration audio, using edge-tts's own
+    word-boundary events. Falls back to a proportional estimate (character
+    position / text length) for any word it can't confidently locate."""
+    word_spans = []
+    search_pos = 0
+    for b in boundaries:
+        idx = text.find(b["text"], search_pos)
+        if idx == -1:
+            idx = search_pos
+        word_spans.append((idx, b["audio_time"]))
+        search_pos = idx + max(1, len(b["text"]))
+
+    def time_for_char(char_index):
+        chosen = None
+        for start, t in word_spans:
+            if start <= char_index:
+                chosen = t
+            else:
+                break
+        if chosen is not None:
+            return chosen
+        return (char_index / len(text)) * boundaries[-1]["audio_time"] if text and boundaries else 0.0
+
+    for cue in cues:
+        cue["audio_time"] = time_for_char(cue["start"])
+    return cues
+
+
+def mix_scene_audio(narration_path: str, cues: list, output_path: str, scene_duration: float):
+    """Layer any detected SFX/BGM cues on top of the narration for one scene.
+    SFX play as a short accent right at the cue's timestamp; BGM plays quietly
+    from the cue's timestamp to the end of the scene. Cues whose sound file
+    hasn't been added to sound_library/ yet are silently skipped (detection
+    still ran — the audio just isn't there yet). Returns the path to use for
+    this scene: the mixed file if anything was layered in, otherwise the
+    original narration path unchanged."""
+    narration_clip = AudioFileClip(narration_path)
+    layers = [narration_clip]
+    extra_clips = []  # sfx/bgm clips, closed separately from narration
+
+    for cue in cues:
+        path = sound_file_path(cue["kind"], cue["name"])
+        if not path:
+            continue
+        try:
+            raw_clip = AudioFileClip(path)
+        except Exception:
+            continue
+
+        start_t = min(cue.get("audio_time", 0.0), max(0.0, scene_duration - 0.1))
+
+        if cue["kind"] == "sfx":
+            clip = _subclip(raw_clip, 0, min(SFX_MAX_SECONDS, raw_clip.duration))
+            clip = _with_volume(clip, SFX_VOLUME)
+            clip = _with_start(clip, start_t)
+        else:  # bgm — fill from the cue point to the end of the scene
+            remain = max(0.5, scene_duration - start_t)
+            bgm_clip = raw_clip
+            if bgm_clip.duration < remain:
+                loops_needed = int(remain // bgm_clip.duration) + 1
+                bgm_clip = concatenate_audioclips([raw_clip] * loops_needed)
+            clip = _subclip(bgm_clip, 0, remain)
+            clip = _with_volume(clip, BGM_VOLUME)
+            clip = _with_start(clip, start_t)
+
+        layers.append(clip)
+        extra_clips.append(raw_clip)
+
+    if len(layers) == 1:
+        narration_clip.close()
+        return narration_path  # nothing found to layer in — reuse as-is
+
+    composite = CompositeAudioClip(layers)
+    composite = _with_duration(composite, scene_duration)
+    composite.write_audiofile(output_path, fps=44100, logger=None)
+    composite.close()
+    narration_clip.close()
+    for c in extra_clips:
+        try:
+            c.close()
+        except Exception:
+            pass
+    return output_path
+
+
+async def generate_all_audio(story_items, scene_voices, scene_styles, progress_callback=None):
     """
-    Generate TTS audio sequentially for every (image_path, text) pair.
-    Returns a list of audio file paths aligned with story_items order.
+    Generate TTS audio sequentially for every (image_path, text) pair, then
+    auto-detect and mix in any SFX/BGM cues found in that scene's text.
+
+    scene_voices: list of voice IDs, one per scene (per-scene voice choice).
+    scene_styles: list of (rate, pitch) tuples, one per scene.
+
+    Returns (audio_paths, scene_cues) — audio_paths aligned with story_items
+    order (ready to hand straight to build_video), and scene_cues (the
+    detected cues per scene, for showing the user what was auto-added).
     """
     audio_paths = []
+    scene_cues = []
     total = len(story_items)
     for index, (_, text) in enumerate(story_items):
-        audio_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
-        await generate_audio_file(text, voice, audio_path)
-        audio_paths.append(audio_path)
+        voice = scene_voices[index]
+        rate, pitch = scene_styles[index]
+        raw_audio_path = os.path.join(TEMP_DIR, f"audio_raw_{index}.mp3")
+        boundaries = await generate_audio_file(text, voice, raw_audio_path, rate=rate, pitch=pitch)
+
+        cues = find_sound_cues(text)
+        _align_cues_to_audio(text, boundaries, cues)
+        scene_cues.append(cues)
+
+        with AudioFileClip(raw_audio_path) as probe:
+            scene_duration = probe.duration
+
+        mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
+        final_path = mix_scene_audio(raw_audio_path, cues, mixed_path, scene_duration)
+        audio_paths.append(final_path)
+
         if progress_callback:
             progress_callback((index + 1) / total, f"Generating audio {index + 1}/{total}...")
-    return audio_paths
+    return audio_paths, scene_cues
 
 
 def build_video(story_items, audio_paths, progress_callback=None, motion_effect="random",
@@ -469,8 +743,24 @@ def main():
         accept_multiple_files=True,
     )
 
+    voice_options = get_available_voices()
+    voice_labels = list(voice_options.keys())
+
+    st.subheader("2️⃣ Default Voice")
+    st.caption("Used to pre-fill every scene below — you can still override the voice per picture.")
+    default_voice_label = st.selectbox("Default voice", options=voice_labels, key="default_voice_label")
+    selected_voice = voice_options[default_voice_label]
+    default_voice_index = voice_labels.index(default_voice_label)
+
     if uploaded_images:
-        st.subheader("2️⃣ Write (or Paste) the Story for Each Picture")
+        st.subheader("3️⃣ Write the Story — Voice & Sounds Auto-Detect Per Scene")
+        st.caption(
+            "Hindi keywords in your text (हंसना, बिजली, प्यार, शेर, डर...) automatically "
+            "trigger a matching sound effect or background music cue — no manual tagging needed. "
+            "Drop the matching files into `sound_library/sfx/` or `sound_library/bgm/` on the server "
+            "(see the top of app.py for the naming convention); cues detected here with no file yet "
+            "are flagged so you know what to add."
+        )
 
         # Optional convenience: bulk-paste a whole script at once, split by blank lines,
         # and auto-fill each picture's text box in order.
@@ -490,7 +780,8 @@ def main():
                 for i, chunk in enumerate(chunks[: len(uploaded_images)]):
                     st.session_state[f"story_text_{i}"] = chunk
 
-        # One row per image: thumbnail + its own text area, right next to each other.
+        # One row per image: thumbnail + its own text area, voice, style, and
+        # a live preview of any sound cues auto-detected in that scene's text.
         for index, uploaded_file in enumerate(uploaded_images):
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -502,11 +793,36 @@ def main():
                     height=120,
                     placeholder="Write or paste the sentence that goes with this picture...",
                 )
-            st.divider()
 
-    st.subheader("3️⃣ Choose a Voice")
-    voice_label = st.selectbox("Select Voice", options=list(VOICE_OPTIONS.keys()))
-    selected_voice = VOICE_OPTIONS[voice_label]
+                scene_voice_label = st.selectbox(
+                    f"Voice for picture {index + 1}",
+                    options=voice_labels,
+                    index=default_voice_index,
+                    key=f"scene_voice_label_{index}",
+                )
+
+                with st.expander("🎙️ Fine-tune expressiveness (optional)"):
+                    st.caption("Push rate/pitch for a more animated, 'vocal' delivery on dramatic lines.")
+                    st.slider("Speaking rate", -50, 50, 0, step=5, key=f"scene_rate_{index}",
+                               help="Negative = slower/more dramatic, positive = faster/more excited")
+                    st.slider("Pitch", -50, 50, 0, step=5, key=f"scene_pitch_{index}",
+                               help="Negative = deeper, positive = higher/brighter")
+
+                scene_text = st.session_state.get(f"story_text_{index}", "")
+                scene_cues_preview = find_sound_cues(scene_text) if scene_text.strip() else []
+                if scene_cues_preview:
+                    bits = []
+                    seen = set()
+                    for cue in scene_cues_preview:
+                        key = (cue["kind"], cue["name"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        icon = "🎵" if cue["kind"] == "bgm" else "🔊"
+                        has_file = sound_file_path(cue["kind"], cue["name"]) is not None
+                        bits.append(f"{icon} {cue['name']}" if has_file else f"{icon} {cue['name']} ⚠️ no file yet")
+                    st.caption("Auto-detected sounds: " + " · ".join(bits))
+            st.divider()
 
     st.subheader("4️⃣ Motion Effect")
     st.caption("Adds motion to each picture so the video feels alive instead of a static slideshow.")
@@ -611,21 +927,50 @@ def main():
             with st.spinner("Setting up workspace..."):
                 setup_workspace()
                 story_items = []
+                scene_voices = []
+                scene_styles = []
                 for index, uploaded_file in enumerate(uploaded_images):
                     image_path = save_uploaded_image(uploaded_file)
                     text = st.session_state[f"story_text_{index}"].strip()
                     story_items.append((image_path, text))
 
-            # ---------------- Audio Generation ----------------
+                    scene_voice_label = st.session_state.get(f"scene_voice_label_{index}", default_voice_label)
+                    scene_voices.append(voice_options.get(scene_voice_label, selected_voice))
+
+                    rate_pct = st.session_state.get(f"scene_rate_{index}", 0)
+                    pitch_hz = st.session_state.get(f"scene_pitch_{index}", 0)
+                    scene_styles.append((f"{rate_pct:+d}%", f"{pitch_hz:+d}Hz"))
+
+            # ---------------- Audio Generation (+ auto SFX/BGM mixing) ----------------
             audio_progress = st.progress(0, text="Starting audio generation...")
 
             def audio_progress_callback(fraction, message):
                 audio_progress.progress(fraction, text=message)
 
-            audio_paths = asyncio.run(
-                generate_all_audio(story_items, selected_voice, audio_progress_callback)
+            audio_paths, scene_cues = asyncio.run(
+                generate_all_audio(story_items, scene_voices, scene_styles, audio_progress_callback)
             )
             audio_progress.progress(1.0, text="Audio generation complete ✅")
+
+            # Let the user know which auto-detected sounds actually got mixed in
+            # vs. which ones are still waiting on a file in sound_library/.
+            all_cues = [c for cues in scene_cues for c in cues]
+            if all_cues:
+                missing = sorted({
+                    f"{c['kind']}:{c['name']}" for c in all_cues
+                    if sound_file_path(c["kind"], c["name"]) is None
+                })
+                found = sorted({
+                    f"{c['kind']}:{c['name']}" for c in all_cues
+                    if sound_file_path(c["kind"], c["name"]) is not None
+                })
+                if found:
+                    st.info("🔊 Sounds mixed in: " + ", ".join(found))
+                if missing:
+                    st.warning(
+                        "⚠️ Detected but not mixed in (no file in sound_library/ yet): "
+                        + ", ".join(missing)
+                    )
 
             # ---------------- Video Compilation ----------------
             video_progress = st.progress(0, text="Starting video assembly...")
