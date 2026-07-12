@@ -1,0 +1,7 @@
+temp_assets/
+final_output.mp4
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+venv/
