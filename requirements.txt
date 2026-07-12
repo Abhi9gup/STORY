@@ -2,3 +2,5 @@ streamlit
 edge-tts
 moviepy
 imageio-ffmpeg
+requests
+fal-client
