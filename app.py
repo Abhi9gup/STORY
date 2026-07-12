@@ -359,6 +359,46 @@ def sound_file_path(kind: str, name: str):
     return None
 
 
+def all_known_sound_tags():
+    """Every (kind, name) pair the keyword map can trigger, in a stable order —
+    used to populate the upload section's tag picker."""
+    seen = []
+    for tag in SOUND_KEYWORD_MAP.values():
+        kind, name = _parse_sound_tag(tag)
+        if kind and (kind, name) not in seen:
+            seen.append((kind, name))
+    return seen
+
+
+def list_sound_library():
+    """Every sound file currently saved, as {(kind, name): filepath}."""
+    found = {}
+    for kind, name in all_known_sound_tags():
+        path = sound_file_path(kind, name)
+        if path:
+            found[(kind, name)] = path
+    return found
+
+
+def save_sound_file(uploaded_file, kind: str, name: str):
+    """Save an uploaded SFX/BGM file into sound_library/ under the right tag
+    name, replacing any existing file for that tag (including a different
+    extension from a previous upload)."""
+    folder = SFX_DIR if kind == "sfx" else BGM_DIR
+    os.makedirs(folder, exist_ok=True)
+    for ext in SOUND_FILE_EXTENSIONS:  # clear any previous version first
+        old_path = os.path.join(folder, name + ext)
+        if os.path.exists(old_path):
+            os.remove(old_path)
+    ext = os.path.splitext(uploaded_file.name)[1].lower() or ".mp3"
+    if ext not in SOUND_FILE_EXTENSIONS:
+        ext = ".mp3"
+    dest_path = os.path.join(folder, name + ext)
+    with open(dest_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return dest_path
+
+
 # --------------------------------------------------------------------------
 # Helper Functions
 # --------------------------------------------------------------------------
@@ -746,14 +786,66 @@ def main():
     voice_options = get_available_voices()
     voice_labels = list(voice_options.keys())
 
-    st.subheader("2️⃣ Default Voice")
+    # ---------------- Step 2: Sound Library (SFX / BGM uploads) ----------------
+    st.subheader("2️⃣ Sound Library — Upload SFX & Music (optional)")
+    st.caption(
+        "Upload audio here for the tags the story auto-detects (laugh, thunder, love, "
+        "devotional, suspense, etc). Anything you don't upload is simply skipped — "
+        "detection still runs, the sound just won't play until you add it."
+    )
+    with st.expander("🎵 Upload / manage sound files", expanded=False):
+        library_now = list_sound_library()
+        known_tags = all_known_sound_tags()
+
+        if library_now:
+            saved_labels = ", ".join(f"{k}:{n}" for (k, n) in library_now.keys())
+            st.success(f"✅ Currently saved: {saved_labels}")
+        else:
+            st.info("No sound files saved yet — everything below will be auto-detected but silent until you add some.")
+
+        sound_uploads = st.file_uploader(
+            "Choose one or more audio files (mp3/wav/ogg/m4a)",
+            type=["mp3", "wav", "ogg", "m4a"],
+            accept_multiple_files=True,
+            key="sound_uploads",
+        )
+
+        if sound_uploads:
+            st.caption("Match each uploaded file to the sound it represents, then save.")
+            tag_display = [f"{'🔊' if k == 'sfx' else '🎵'} {k}:{n}" for k, n in known_tags]
+            for u_index, up_file in enumerate(sound_uploads):
+                stem = os.path.splitext(up_file.name)[0].lower()
+                guessed_index = next(
+                    (i for i, (k, n) in enumerate(known_tags) if n == stem), 0
+                )
+                chosen_label = st.selectbox(
+                    f"'{up_file.name}' is the sound for:",
+                    options=tag_display,
+                    index=guessed_index,
+                    key=f"sound_tag_choice_{u_index}",
+                )
+                st.session_state[f"sound_tag_kind_{u_index}"] = known_tags[tag_display.index(chosen_label)][0]
+                st.session_state[f"sound_tag_name_{u_index}"] = known_tags[tag_display.index(chosen_label)][1]
+
+            if st.button("💾 Save uploaded sounds to library"):
+                saved = []
+                for u_index, up_file in enumerate(sound_uploads):
+                    kind = st.session_state.get(f"sound_tag_kind_{u_index}")
+                    name = st.session_state.get(f"sound_tag_name_{u_index}")
+                    if kind and name:
+                        save_sound_file(up_file, kind, name)
+                        saved.append(f"{kind}:{name}")
+                if saved:
+                    st.success("Saved: " + ", ".join(saved) + " — reload the page to refresh the list above.")
+
+    st.subheader("3️⃣ Default Voice")
     st.caption("Used to pre-fill every scene below — you can still override the voice per picture.")
     default_voice_label = st.selectbox("Default voice", options=voice_labels, key="default_voice_label")
     selected_voice = voice_options[default_voice_label]
     default_voice_index = voice_labels.index(default_voice_label)
 
     if uploaded_images:
-        st.subheader("3️⃣ Write the Story — Voice & Sounds Auto-Detect Per Scene")
+        st.subheader("4️⃣ Write the Story — Voice & Sounds Auto-Detect Per Scene")
         st.caption(
             "Hindi keywords in your text (हंसना, बिजली, प्यार, शेर, डर...) automatically "
             "trigger a matching sound effect or background music cue — no manual tagging needed. "
@@ -824,7 +916,7 @@ def main():
                     st.caption("Auto-detected sounds: " + " · ".join(bits))
             st.divider()
 
-    st.subheader("4️⃣ Motion Effect")
+    st.subheader("5️⃣ Motion Effect")
     st.caption("Adds motion to each picture so the video feels alive instead of a static slideshow.")
     motion_choice = st.selectbox(
         "Motion style",
@@ -895,7 +987,7 @@ def main():
                         placeholder="e.g. gentle hand wave, background trees swaying",
                     )
 
-    st.subheader("5️⃣ Generate")
+    st.subheader("6️⃣ Generate")
     generate_clicked = st.button("🚀 Generate Video", type="primary", use_container_width=True)
 
     if generate_clicked:
