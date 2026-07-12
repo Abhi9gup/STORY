@@ -9,13 +9,24 @@ Run with:
     streamlit run app.py
 
 Dependencies:
-    pip install streamlit edge-tts moviepy
+    pip install streamlit edge-tts moviepy imageio-ffmpeg requests
+    pip install fal-client   # only needed for the AI Full Motion option
 """
 
 import os
 import shutil
+import random
 import asyncio
 import traceback
+import requests
+
+# fal_client is optional — only needed if the user turns on AI Full Motion.
+# The rest of the app works fine without it installed.
+try:
+    import fal_client
+    FAL_CLIENT_AVAILABLE = True
+except ModuleNotFoundError:
+    FAL_CLIENT_AVAILABLE = False
 
 # Ensure MoviePy can find a working ffmpeg binary even if it isn't on the
 # system PATH (e.g. on locked-down office laptops where PATH editing or
@@ -35,12 +46,16 @@ try:
     from moviepy.editor import (
         ImageClip,
         AudioFileClip,
+        VideoFileClip,
+        CompositeVideoClip,
         concatenate_videoclips,
     )
 except ModuleNotFoundError:
     from moviepy import (
         ImageClip,
         AudioFileClip,
+        VideoFileClip,
+        CompositeVideoClip,
         concatenate_videoclips,
     )
 
@@ -57,6 +72,162 @@ def _with_audio(clip, audio_clip):
     if hasattr(clip, "with_audio"):
         return clip.with_audio(audio_clip)
     return clip.set_audio(audio_clip)
+
+
+def _resized(clip, factor):
+    """resized() on MoviePy 2.x, resize() on 1.x. `factor` can be a number or a function of t."""
+    if hasattr(clip, "resized"):
+        return clip.resized(factor)
+    return clip.resize(factor)
+
+
+def _positioned(clip, pos):
+    """with_position() on MoviePy 2.x, set_position() on 1.x. `pos` can be a tuple or a function of t."""
+    if hasattr(clip, "with_position"):
+        return clip.with_position(pos)
+    return clip.set_position(pos)
+
+
+KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
+
+
+def apply_ken_burns(image_clip, duration, effect=None, zoom_ratio=1.18):
+    """
+    Wrap a static ImageClip with a slow zoom and/or pan over its lifetime so it
+    reads as motion instead of a frozen photo. Returns a same-sized clip
+    (image_clip.size) ready to have duration/audio attached.
+    """
+    w, h = image_clip.size
+    effect = effect or random.choice(KEN_BURNS_EFFECTS)
+
+    def scale_at(t):
+        progress = min(max(t / duration, 0), 1) if duration > 0 else 0
+        if effect == "zoom_in":
+            return 1 + (zoom_ratio - 1) * progress
+        elif effect == "zoom_out":
+            return zoom_ratio - (zoom_ratio - 1) * progress
+        else:
+            # Panning effects keep a constant zoom so there's room to move around in.
+            return zoom_ratio
+
+    moving_clip = _resized(image_clip, scale_at)
+
+    def pos_at(t):
+        progress = min(max(t / duration, 0), 1) if duration > 0 else 0
+        cur_scale = scale_at(t)
+        cur_w, cur_h = w * cur_scale, h * cur_scale
+        max_x = cur_w - w
+        max_y = cur_h - h
+
+        if effect == "pan_left":
+            x, y = -max_x * progress, -max_y / 2
+        elif effect == "pan_right":
+            x, y = -max_x * (1 - progress), -max_y / 2
+        elif effect == "pan_up":
+            x, y = -max_x / 2, -max_y * progress
+        elif effect == "pan_down":
+            x, y = -max_x / 2, -max_y * (1 - progress)
+        else:  # zoom_in / zoom_out stay centered
+            x, y = -max_x / 2, -max_y / 2
+        return (x, y)
+
+    moving_clip = _positioned(moving_clip, pos_at)
+    framed_clip = CompositeVideoClip([moving_clip], size=(w, h))
+    return framed_clip
+
+
+# --------------------------------------------------------------------------
+# AI Full Motion pipeline (fal.ai)
+# --------------------------------------------------------------------------
+# Two open-source models, chained together:
+#   1. LTX-2.3 (image-to-video)  -> animates the photo: body/hand/background motion
+#   2. LatentSync (video-to-video) -> re-syncs the mouth in that video to your narration audio
+#
+# Requires: pip install fal-client
+#           a FAL_KEY (from https://fal.ai/dashboard/keys) set as an env var
+#           or entered in the sidebar in the app.
+#
+# Cost is pay-per-use (no subscription) — roughly a few cents to ~$0.50 per
+# picture depending on length/resolution. Check https://fal.ai/pricing for
+# current rates before generating a large batch.
+
+LTX_DURATION_BUCKETS = [6, 8, 10]  # seconds — the only durations LTX-2.3 accepts
+
+
+def _pick_duration_bucket(target_seconds: float) -> str:
+    """LTX-2.3 only generates 6s/8s/10s clips. Pick the closest bucket that's
+    long enough to cover the narration (or the longest bucket if narration
+    runs longer than 10s)."""
+    for bucket in LTX_DURATION_BUCKETS:
+        if target_seconds <= bucket:
+            return str(bucket)
+    return str(LTX_DURATION_BUCKETS[-1])
+
+
+def generate_ai_motion_clip(image_path: str, audio_path: str, motion_prompt: str,
+                             output_path: str, fal_key: str = None,
+                             status_callback=None) -> str:
+    """
+    Runs the two-stage fal.ai pipeline for one (image, audio) pair and saves
+    the final lip-synced, full-motion clip to output_path. Returns output_path.
+    Raises on any failure — caller decides how to fall back.
+    """
+    if not FAL_CLIENT_AVAILABLE:
+        raise RuntimeError("fal-client is not installed. Run: pip install fal-client")
+
+    if fal_key:
+        os.environ["FAL_KEY"] = fal_key
+    if not os.environ.get("FAL_KEY"):
+        raise RuntimeError("No FAL_KEY set. Get one at https://fal.ai/dashboard/keys")
+
+    def report(msg):
+        if status_callback:
+            status_callback(msg)
+
+    # Rough narration duration, just to pick a sensible LTX clip length.
+    with AudioFileClip(audio_path) as probe:
+        target_seconds = probe.duration
+    duration_bucket = _pick_duration_bucket(target_seconds)
+
+    # ---- Stage 1: animate the still photo (LTX-2.3 image-to-video) ----
+    report("Uploading photo...")
+    image_url = fal_client.upload_file(image_path)
+
+    report("Generating motion (hands/body/background)...")
+    motion_result = fal_client.subscribe(
+        "fal-ai/ltx-2.3/image-to-video",
+        arguments={
+            "image_url": image_url,
+            "prompt": motion_prompt or "subtle natural motion, gentle hand and body movement, slight background movement, realistic",
+            "duration": duration_bucket,
+        },
+        with_logs=False,
+    )
+    motion_video_url = motion_result["video"]["url"]
+
+    # ---- Stage 2: sync lips to the narration audio (LatentSync) ----
+    report("Uploading narration audio...")
+    audio_url = fal_client.upload_file(audio_path)
+
+    report("Syncing lips to narration...")
+    lipsync_result = fal_client.subscribe(
+        "fal-ai/latentsync",
+        arguments={
+            "video_url": motion_video_url,
+            "audio_url": audio_url,
+        },
+        with_logs=False,
+    )
+    final_video_url = lipsync_result["video"]["url"]
+
+    # ---- Download the final clip locally so MoviePy can stitch it in ----
+    report("Downloading generated clip...")
+    response = requests.get(final_video_url, timeout=120)
+    response.raise_for_status()
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    return output_path
 
 # --------------------------------------------------------------------------
 # Constants
@@ -112,14 +283,22 @@ async def generate_all_audio(story_items, voice: str, progress_callback=None):
     return audio_paths
 
 
-def build_video(story_items, audio_paths, progress_callback=None):
+def build_video(story_items, audio_paths, progress_callback=None, motion_effect="random",
+                 motion_prompts=None, fal_key=None):
     """
     Build the final video by pairing each image with its corresponding audio clip.
+    motion_effect:
+      "none"      -> static image (original behavior)
+      "random"/"zoom_in"/etc. -> Ken Burns pan/zoom (camera motion only)
+      "ai_motion" -> full AI-generated motion + lip-sync via fal.ai (LTX-2.3 + LatentSync)
+                     Falls back to Ken Burns for any picture where generation fails,
+                     so one bad/slow API call doesn't kill the whole video.
     Returns the path to the exported video file.
     """
     video_segments = []
     audio_clips_to_close = []
     image_clips_to_close = []
+    ai_generated_paths = []
 
     total = len(story_items)
     try:
@@ -129,13 +308,53 @@ def build_video(story_items, audio_paths, progress_callback=None):
             audio_clips_to_close.append(audio_clip)
 
             duration = audio_clip.duration
+            segment_clip = None
 
-            image_clip = ImageClip(image_path)
-            image_clip = _with_duration(image_clip, duration)
-            image_clip = _with_audio(image_clip, audio_clip)
-            image_clips_to_close.append(image_clip)
+            if motion_effect == "ai_motion":
+                try:
+                    if progress_callback:
+                        progress_callback(
+                            (index) / total,
+                            f"Generating AI motion for picture {index + 1}/{total} (this can take a minute)...",
+                        )
+                    prompt = (motion_prompts or {}).get(index, "")
+                    clip_path = os.path.join(TEMP_DIR, f"ai_motion_{index}.mp4")
+                    generate_ai_motion_clip(
+                        image_path, audio_path, prompt, clip_path, fal_key=fal_key,
+                        status_callback=lambda msg: progress_callback(
+                            (index) / total, f"Picture {index + 1}/{total}: {msg}"
+                        ) if progress_callback else None,
+                    )
+                    ai_generated_paths.append(clip_path)
+                    video_clip = VideoFileClip(clip_path)
+                    image_clips_to_close.append(video_clip)
+                    # LatentSync already carries the narration audio in its output,
+                    # so use the clip's own audio rather than re-attaching ours.
+                    segment_clip = video_clip
+                except Exception as ai_error:
+                    if progress_callback:
+                        progress_callback(
+                            (index + 1) / total,
+                            f"⚠️ AI motion failed for picture {index + 1} ({ai_error}); using Ken Burns instead...",
+                        )
+                    segment_clip = None  # fall through to Ken Burns below
 
-            video_segments.append(image_clip)
+            if segment_clip is None:
+                image_clip = ImageClip(image_path)
+                if motion_effect not in ("none", "ai_motion"):
+                    effect = None if motion_effect == "random" else motion_effect
+                    image_clip = apply_ken_burns(image_clip, duration, effect=effect)
+                elif motion_effect == "ai_motion":
+                    # AI motion failed for this one — still give it camera motion
+                    # rather than a flat static frame.
+                    image_clip = apply_ken_burns(image_clip, duration, effect=None)
+
+                image_clip = _with_duration(image_clip, duration)
+                image_clip = _with_audio(image_clip, audio_clip)
+                image_clips_to_close.append(image_clip)
+                segment_clip = image_clip
+
+            video_segments.append(segment_clip)
 
             if progress_callback:
                 progress_callback(
@@ -183,10 +402,57 @@ def build_video(story_items, audio_paths, progress_callback=None):
 
 
 # --------------------------------------------------------------------------
+# Password Gate
+# --------------------------------------------------------------------------
+def check_password() -> bool:
+    """
+    Simple shared-password gate for a publicly deployed app. Set APP_PASSWORD
+    in Streamlit secrets (Settings -> Secrets):
+        APP_PASSWORD = "your-password-here"
+    Locally, you can instead set it as an environment variable of the same name.
+    Returns True once the correct password has been entered for this session.
+    """
+    correct_password = None
+    if hasattr(st, "secrets"):
+        correct_password = st.secrets.get("APP_PASSWORD")
+    if not correct_password:
+        correct_password = os.environ.get("APP_PASSWORD")
+
+    # If no password is configured anywhere, don't lock people out — just warn.
+    if not correct_password:
+        st.warning(
+            "⚠️ No APP_PASSWORD is configured, so this app is currently open to "
+            "anyone with the link. Set APP_PASSWORD in Streamlit secrets to lock it."
+        )
+        return True
+
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.title("🔒 Story-to-Video Generator")
+    st.caption("This app is password protected.")
+    password_attempt = st.text_input("Enter password", type="password", key="password_attempt")
+    submit = st.button("Unlock")
+
+    if submit:
+        if password_attempt == correct_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("❌ Incorrect password.")
+
+    return False
+
+
+# --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="Story-to-Video Generator", page_icon="🎬", layout="centered")
+
+    if not check_password():
+        return
+
     st.title("🎬 Automated Story-to-Video Generator")
     st.caption(
         "Upload your pictures, write the story for each one right below it, "
@@ -242,7 +508,78 @@ def main():
     voice_label = st.selectbox("Select Voice", options=list(VOICE_OPTIONS.keys()))
     selected_voice = VOICE_OPTIONS[voice_label]
 
-    st.subheader("4️⃣ Generate")
+    st.subheader("4️⃣ Motion Effect")
+    st.caption("Adds motion to each picture so the video feels alive instead of a static slideshow.")
+    motion_choice = st.selectbox(
+        "Motion style",
+        options=[
+            "Random (different per picture)",
+            "Zoom In",
+            "Zoom Out",
+            "Pan Left",
+            "Pan Right",
+            "Pan Up",
+            "Pan Down",
+            "AI Full Motion — lips, hands, body (requires fal.ai API key, paid per use)",
+            "None (static, original behavior)",
+        ],
+    )
+    motion_effect_map = {
+        "Random (different per picture)": "random",
+        "Zoom In": "zoom_in",
+        "Zoom Out": "zoom_out",
+        "Pan Left": "pan_left",
+        "Pan Right": "pan_right",
+        "Pan Up": "pan_up",
+        "Pan Down": "pan_down",
+        "AI Full Motion — lips, hands, body (requires fal.ai API key, paid per use)": "ai_motion",
+        "None (static, original behavior)": "none",
+    }
+    selected_motion_effect = motion_effect_map[motion_choice]
+
+    fal_key_input = ""
+    motion_prompts = {}
+    if selected_motion_effect == "ai_motion":
+        with st.expander("⚙️ AI Full Motion setup", expanded=True):
+            st.markdown(
+                "This mode sends each picture + narration to **fal.ai**, which runs two "
+                "open-source models: **LTX-2.3** (animates hands/body/background) and "
+                "**LatentSync** (syncs the mouth to your narration). It costs a small "
+                "amount per picture (check current rates at fal.ai/pricing) — nothing "
+                "runs on your laptop, no GPU needed on your end."
+            )
+            if not FAL_CLIENT_AVAILABLE:
+                st.error("Missing dependency. Run: `pip install fal-client` and restart the app.")
+
+            secret_key = st.secrets.get("FAL_KEY") if hasattr(st, "secrets") else None
+            if secret_key:
+                fal_key_input = secret_key
+                st.success("Using fal.ai API key from app secrets ✅")
+            else:
+                fal_key_input = st.text_input(
+                    "fal.ai API key (from fal.ai/dashboard/keys)",
+                    type="password",
+                    help=(
+                        "For a deployed app, set this as FAL_KEY in Streamlit secrets instead "
+                        "so visitors don't need to paste a key. This box is a fallback for "
+                        "local runs or when no secret is configured."
+                    ),
+                )
+
+            st.caption(
+                "Optional: describe the motion you want for each picture below "
+                "(e.g. 'she waves and smiles, leaves rustling in the background'). "
+                "Leave blank for a sensible default."
+            )
+            if uploaded_images:
+                for index, uploaded_file in enumerate(uploaded_images):
+                    motion_prompts[index] = st.text_input(
+                        f"Motion for picture {index + 1} ({uploaded_file.name})",
+                        key=f"motion_prompt_{index}",
+                        placeholder="e.g. gentle hand wave, background trees swaying",
+                    )
+
+    st.subheader("5️⃣ Generate")
     generate_clicked = st.button("🚀 Generate Video", type="primary", use_container_width=True)
 
     if generate_clicked:
@@ -261,6 +598,14 @@ def main():
             )
             st.error(f"❌ Please add story text for: {missing_names}")
             return
+
+        if selected_motion_effect == "ai_motion":
+            if not FAL_CLIENT_AVAILABLE:
+                st.error("❌ AI Full Motion needs the fal-client package. Run: pip install fal-client")
+                return
+            if not fal_key_input and not os.environ.get("FAL_KEY"):
+                st.error("❌ AI Full Motion needs a fal.ai API key. Paste one in the setup box above.")
+                return
 
         try:
             with st.spinner("Setting up workspace..."):
@@ -289,7 +634,14 @@ def main():
                 video_progress.progress(fraction, text=message)
 
             with st.spinner("Compiling final video... this may take a moment."):
-                output_path = build_video(story_items, audio_paths, video_progress_callback)
+                output_path = build_video(
+                    story_items,
+                    audio_paths,
+                    video_progress_callback,
+                    motion_effect=selected_motion_effect,
+                    motion_prompts=motion_prompts,
+                    fal_key=fal_key_input,
+                )
 
             video_progress.progress(1.0, text="Video assembly complete ✅")
 
