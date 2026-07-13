@@ -527,15 +527,25 @@ def _align_cues_to_audio(text: str, boundaries: list, cues: list):
     return cues
 
 
-def mix_scene_audio(narration_path: str, cues: list, output_path: str, scene_duration: float):
+def mix_scene_audio(narration_input, cues, output_path, scene_duration):
     """Layer any detected SFX/BGM cues on top of the narration for one scene.
+    
+    narration_input: either a file path (str) or an AudioFileClip object
     SFX play as a short accent right at the cue's timestamp; BGM plays quietly
     from the cue's timestamp to the end of the scene. Cues whose sound file
     hasn't been added to sound_library/ yet are silently skipped (detection
     still ran — the audio just isn't there yet). Returns the path to use for
     this scene: the mixed file if anything was layered in, otherwise the
     original narration path unchanged."""
-    narration_clip = AudioFileClip(narration_path)
+    
+    # Handle both clip and path inputs
+    if isinstance(narration_input, str):
+        narration_clip = AudioFileClip(narration_input)
+        close_narration = True
+    else:
+        narration_clip = narration_input
+        close_narration = False
+    
     layers = [narration_clip]
     extra_clips = []  # sfx/bgm clips, closed separately from narration
 
@@ -568,14 +578,17 @@ def mix_scene_audio(narration_path: str, cues: list, output_path: str, scene_dur
         extra_clips.append(raw_clip)
 
     if len(layers) == 1:
-        narration_clip.close()
-        return narration_path  # nothing found to layer in — reuse as-is
+        if close_narration:
+            narration_clip.close()
+        return output_path if isinstance(narration_input, str) else None
 
     composite = CompositeAudioClip(layers)
-    composite = _with_duration(composite, scene_duration)
+    # Use a small epsilon to avoid floating-point precision issues
+    composite = _with_duration(composite, min(scene_duration, narration_clip.duration + 0.1))
     composite.write_audiofile(output_path, fps=44100, logger=None)
     composite.close()
-    narration_clip.close()
+    if close_narration:
+        narration_clip.close()
     for c in extra_clips:
         try:
             c.close()
@@ -642,14 +655,12 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
                     cue["audio_time"] = ratio * scene_duration
             scene_cues.append(cues)
 
-            # Mix in SFX/BGM
-            temp_concat_path = os.path.join(TEMP_DIR, f"concat_{index}.mp3")
-            concatenated.write_audiofile(temp_concat_path, fps=44100, logger=None)
-            concatenated.close()
+            # Mix in SFX/BGM (pass clip directly to avoid temp file precision issues)
+            mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
+            final_path = mix_scene_audio(concatenated, cues, mixed_path, scene_duration)
+            # concatenated clip is now closed by mix_scene_audio
             for clip in slot_clips:
                 clip.close()
-
-            final_path = mix_scene_audio(temp_concat_path, cues, mixed_path, scene_duration)
             audio_paths.append(final_path)
         else:
             # No non-empty slots — create a silent 2-second audio placeholder
@@ -658,7 +669,7 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
             import numpy as np
             from moviepy.audio.AudioClip import AudioClip
             silent_clip = AudioClip(make_frame=lambda t: np.zeros((2,)), duration=2.0, fps=44100)
-            silent_clip.write_audiofile(silent_path, fps=44100, logger=None, verbose=False)
+            silent_clip.write_audiofile(silent_path, fps=44100, logger=None)
             silent_clip.close()
             audio_paths.append(silent_path)
             scene_cues.append([])
