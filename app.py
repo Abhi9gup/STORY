@@ -1116,6 +1116,27 @@ def main():
                                 bits.append(f"{icon} {cue['name']}" if has_file else f"{icon} {cue['name']} ⚠️")
                             st.caption("Auto-detected sounds: " + " · ".join(bits))
 
+                # Collect dialogue slots for this scene EXPLICITLY
+                dialogue_slots = []
+                for slot_idx in range(NUM_DIALOGUE_SLOTS):
+                    slot_text_key = f"slot_text_{index}_{slot_idx}"
+                    slot_text = st.session_state.get(slot_text_key, "").strip()
+                    
+                    if slot_text:  # Only include non-empty slots
+                        slot_voice_key = f"slot_voice_label_{index}_{slot_idx}"
+                        slot_voice_label = st.session_state.get(slot_voice_key, default_voice_label)
+                        slot_voice = voice_options.get(slot_voice_label, selected_voice)
+                        
+                        rate_pct = st.session_state.get(f"slot_rate_{index}_{slot_idx}", 0)
+                        pitch_hz = st.session_state.get(f"slot_pitch_{index}_{slot_idx}", 0)
+                        
+                        dialogue_slots.append({
+                            "text": slot_text,
+                            "voice": slot_voice,
+                            "rate": f"{rate_pct:+d}%",
+                            "pitch": f"{pitch_hz:+d}Hz",
+                        })
+
                 # Store the dialogue slots for this scene
                 st.session_state[f"scene_dialogue_{index}"] = dialogue_slots if dialogue_slots else [
                     {"text": "", "voice": selected_voice, "rate": "+0%", "pitch": "+0Hz"}
