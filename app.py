@@ -154,11 +154,77 @@ def _with_volume(clip, factor):
     return clip.volumex(factor)
 
 
+def _with_duration(clip, duration):
+    """with_duration() on MoviePy 2.x, set_duration() on 1.x."""
+    if hasattr(clip, "with_duration"):
+        return clip.with_duration(duration)
+    return clip.set_duration(duration)
+
+
+def _with_audio(clip, audio_clip):
+    """with_audio() on MoviePy 2.x, set_audio() on 1.x."""
+    if hasattr(clip, "with_audio"):
+        return clip.with_audio(audio_clip)
+    return clip.set_audio(audio_clip)
+
+
 def _subclip(clip, start, end):
     """subclipped() on MoviePy 2.x, subclip() on 1.x."""
     if hasattr(clip, "subclipped"):
         return clip.subclipped(start, end)
     return clip.subclip(start, end)
+
+
+def _pad_audio_with_silence(audio_clip, target_duration):
+    """Extend an audio clip to target_duration by concatenating silence at the end.
+    If audio is already longer than target_duration, trim it."""
+    if audio_clip.duration >= target_duration:
+        # Trim to target if already longer
+        return _subclip(audio_clip, 0, target_duration)
+    
+    # Pad with silence
+    silence_duration = target_duration - audio_clip.duration
+    from moviepy.audio.AudioClip import AudioClip
+    
+    # Create silent audio clip
+    silence = AudioClip(
+        make_frame=lambda t: np.zeros((2,)),
+        duration=silence_duration,
+        fps=44100
+    )
+    
+    # Concatenate: original audio + silence
+    padded = concatenate_audioclips([audio_clip, silence])
+    return padded
+
+
+def _video_audio_with_dynamic_volume(video_audio, narration_duration, total_duration, ducked_volume):
+    """Split video audio into two sections:
+    - 0 to narration_duration: play at ducked_volume (under narration)
+    - narration_duration to total_duration: play at full volume (after narration ends)
+    
+    Returns a composite audio with these two sections layered."""
+    if narration_duration >= total_duration:
+        # Narration covers the whole video — keep it ducked throughout
+        return _with_volume(video_audio, ducked_volume)
+    
+    # Split original audio into two parts
+    narration_section = _subclip(video_audio, 0, narration_duration)
+    remaining_section = _subclip(video_audio, narration_duration, total_duration)
+    
+    # Apply volumes
+    narration_section_ducked = _with_volume(narration_section, ducked_volume)
+    remaining_section_full = _with_volume(remaining_section, 1.0)  # Full volume
+    
+    # Set start times and layer
+    narration_section_ducked = _with_start(narration_section_ducked, 0)
+    remaining_section_full = _with_start(remaining_section_full, narration_duration)
+    
+    # Composite them
+    dynamic_audio = CompositeAudioClip([narration_section_ducked, remaining_section_full])
+    dynamic_audio = _with_duration(dynamic_audio, total_duration)
+    
+    return dynamic_audio
 
 
 KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
