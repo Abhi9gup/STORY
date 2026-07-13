@@ -578,17 +578,24 @@ def mix_scene_audio(narration_input, cues, output_path, scene_duration):
         extra_clips.append(raw_clip)
 
     if len(layers) == 1:
-        if close_narration:
-            narration_clip.close()
-        return output_path if isinstance(narration_input, str) else None
+        # No SFX/BGM to mix
+        if isinstance(narration_input, str):
+            # Input was a file path — just return it (already exists on disk)
+            if close_narration:
+                narration_clip.close()
+            return narration_input
+        else:
+            # Input was a clip — write it to output_path then close
+            narration_clip.write_audiofile(output_path, fps=44100, logger=None)
+            narration_clip.close()  # Always close, whether close_narration flag or not
+            return output_path
 
     composite = CompositeAudioClip(layers)
     # Use a small epsilon to avoid floating-point precision issues
     composite = _with_duration(composite, min(scene_duration, narration_clip.duration + 0.1))
     composite.write_audiofile(output_path, fps=44100, logger=None)
     composite.close()
-    if close_narration:
-        narration_clip.close()
+    narration_clip.close()  # Always close — either we opened it from a path, or it's a clip we're done with
     for c in extra_clips:
         try:
             c.close()
@@ -658,7 +665,7 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
             # Mix in SFX/BGM (pass clip directly to avoid temp file precision issues)
             mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
             final_path = mix_scene_audio(concatenated, cues, mixed_path, scene_duration)
-            # concatenated clip is now closed by mix_scene_audio
+            # concatenated clip is now closed by mix_scene_audio, so don't close it again
             for clip in slot_clips:
                 clip.close()
             audio_paths.append(final_path)
