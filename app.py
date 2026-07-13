@@ -20,6 +20,7 @@ import random
 import asyncio
 import traceback
 import requests
+import numpy as np
 
 # fal_client is optional — only needed if the user turns on AI Full Motion.
 # The rest of the app works fine without it installed.
@@ -67,7 +68,53 @@ except ModuleNotFoundError:
 # MoviePy 2.x renamed several clip methods (set_duration -> with_duration,
 # set_audio -> with_audio). These small helpers call whichever one exists,
 # so the app works on both MoviePy 1.x and 2.x.
-def _with_duration(clip, duration):
+def _video_audio_with_dynamic_volume(video_audio, narration_duration, total_duration, ducked_volume):
+    """Split video audio into two sections:
+    - 0 to narration_duration: play at ducked_volume (under narration)
+    - narration_duration to total_duration: play at full volume (after narration ends)
+    
+    Returns a composite audio with these two sections layered."""
+    if narration_duration >= total_duration:
+        # Narration covers the whole video — keep it ducked throughout
+        return _with_volume(video_audio, ducked_volume)
+    
+    # Split original audio into two parts
+    narration_section = _subclip(video_audio, 0, narration_duration)
+    remaining_section = _subclip(video_audio, narration_duration, total_duration)
+    
+    # Apply volumes
+    narration_section_ducked = _with_volume(narration_section, ducked_volume)
+    remaining_section_full = _with_volume(remaining_section, 1.0)  # Full volume
+    
+    # Set start times and layer
+    narration_section_ducked = _with_start(narration_section_ducked, 0)
+    remaining_section_full = _with_start(remaining_section_full, narration_duration)
+    
+    # Composite them
+    dynamic_audio = CompositeAudioClip([narration_section_ducked, remaining_section_full])
+    dynamic_audio = _with_duration(dynamic_audio, total_duration)
+    
+    return dynamic_audio
+    """Extend an audio clip to target_duration by concatenating silence at the end.
+    If audio is already longer than target_duration, trim it."""
+    if audio_clip.duration >= target_duration:
+        # Trim to target if already longer
+        return _subclip(audio_clip, 0, target_duration)
+    
+    # Pad with silence
+    silence_duration = target_duration - audio_clip.duration
+    from moviepy.audio.AudioClip import AudioClip
+    
+    # Create silent audio clip
+    silence = AudioClip(
+        make_frame=lambda t: np.zeros((2,)),
+        duration=silence_duration,
+        fps=44100
+    )
+    
+    # Concatenate: original audio + silence
+    padded = concatenate_audioclips([audio_clip, silence])
+    return padded
     if hasattr(clip, "with_duration"):
         return clip.with_duration(duration)
     return clip.set_duration(duration)
@@ -673,7 +720,6 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
             # No non-empty slots — create a silent 2-second audio placeholder
             # (build_video still needs something to work with)
             silent_path = os.path.join(TEMP_DIR, f"audio_silent_{index}.mp3")
-            import numpy as np
             from moviepy.audio.AudioClip import AudioClip
             silent_clip = AudioClip(make_frame=lambda t: np.zeros((2,)), duration=2.0, fps=44100)
             silent_clip.write_audiofile(silent_path, fps=44100, logger=None)
@@ -755,23 +801,25 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 # Pad or trim narration to match final segment duration
                 if narration_duration < duration:
                     # Video is longer → pad narration with silence at the end
-                    narration_to_mix = _with_duration(audio_clip, duration)
+                    narration_to_mix = _pad_audio_with_silence(audio_clip, duration)
                 else:
-                    # Narration is same or longer → use as-is (will be trimmed to duration below)
-                    narration_to_mix = audio_clip
+                    # Narration is same or longer → trim to duration
+                    narration_to_mix = _subclip(audio_clip, 0, duration)
 
                 if original_audio is not None and video_vol > 0:
-                    # Mix video's original audio (quiet) + narration (loud)
-                    ducked_original = _with_volume(original_audio, video_vol)
+                    # Mix video's original audio + narration
+                    # Video audio is ducked during narration, full volume after
+                    dynamic_video_audio = _video_audio_with_dynamic_volume(
+                        original_audio, narration_duration, duration, video_vol
+                    )
                     narration_boosted = _with_volume(narration_to_mix, NARRATION_VOLUME_WHEN_MIXED)
-                    combined_audio = CompositeAudioClip([ducked_original, narration_boosted])
-                    combined_audio = _with_duration(combined_audio, duration)
+                    combined_audio = CompositeAudioClip([dynamic_video_audio, narration_boosted])
+                    combined_audio = _pad_audio_with_silence(combined_audio, duration)
                     segment_clip = _with_audio(segment_clip, combined_audio)
                     audio_clips_to_close.append(combined_audio)
                 else:
-                    # No video audio, just attach narration (padded if necessary)
-                    narration_final = _with_duration(narration_to_mix, duration)
-                    segment_clip = _with_audio(segment_clip, narration_final)
+                    # No video audio, just attach narration (already padded if necessary)
+                    segment_clip = _with_audio(segment_clip, narration_to_mix)
 
                 image_clips_to_close.append(segment_clip)
                 video_segments.append(segment_clip)
