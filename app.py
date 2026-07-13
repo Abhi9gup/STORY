@@ -1229,10 +1229,15 @@ def main():
             st.error("❌ Please upload at least one picture before generating the video.")
             return
 
-        missing_text_indexes = [
-            i for i in range(len(uploaded_images))
-            if not st.session_state.get(f"story_text_{i}", "").strip()
-        ]
+        # Check if each scene has at least ONE speaker with text (multi-dialogue slots)
+        missing_text_indexes = []
+        for i in range(len(uploaded_images)):
+            scene_dialogue = st.session_state.get(f"scene_dialogue_{i}", [])
+            # Filter out empty slots
+            has_text = any(slot.get("text", "").strip() for slot in scene_dialogue)
+            if not has_text:
+                missing_text_indexes.append(i)
+
         if missing_text_indexes:
             missing_names = ", ".join(
                 uploaded_images[i].name for i in missing_text_indexes
