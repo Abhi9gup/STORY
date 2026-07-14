@@ -68,64 +68,6 @@ except ModuleNotFoundError:
 # MoviePy 2.x renamed several clip methods (set_duration -> with_duration,
 # set_audio -> with_audio). These small helpers call whichever one exists,
 # so the app works on both MoviePy 1.x and 2.x.
-def _video_audio_with_dynamic_volume(video_audio, narration_duration, total_duration, ducked_volume):
-    """Split video audio into two sections:
-    - 0 to narration_duration: play at ducked_volume (under narration)
-    - narration_duration to total_duration: play at full volume (after narration ends)
-    
-    Returns a composite audio with these two sections layered."""
-    if narration_duration >= total_duration:
-        # Narration covers the whole video — keep it ducked throughout
-        return _with_volume(video_audio, ducked_volume)
-    
-    # Split original audio into two parts
-    narration_section = _subclip(video_audio, 0, narration_duration)
-    remaining_section = _subclip(video_audio, narration_duration, total_duration)
-    
-    # Apply volumes
-    narration_section_ducked = _with_volume(narration_section, ducked_volume)
-    remaining_section_full = _with_volume(remaining_section, 1.0)  # Full volume
-    
-    # Set start times and layer
-    narration_section_ducked = _with_start(narration_section_ducked, 0)
-    remaining_section_full = _with_start(remaining_section_full, narration_duration)
-    
-    # Composite them
-    dynamic_audio = CompositeAudioClip([narration_section_ducked, remaining_section_full])
-    dynamic_audio = _with_duration(dynamic_audio, total_duration)
-    
-    return dynamic_audio
-    """Extend an audio clip to target_duration by concatenating silence at the end.
-    If audio is already longer than target_duration, trim it."""
-    if audio_clip.duration >= target_duration:
-        # Trim to target if already longer
-        return _subclip(audio_clip, 0, target_duration)
-    
-    # Pad with silence
-    silence_duration = target_duration - audio_clip.duration
-    from moviepy.audio.AudioClip import AudioClip
-    
-    # Create silent audio clip
-    silence = AudioClip(
-        make_frame=lambda t: np.zeros((2,)),
-        duration=silence_duration,
-        fps=44100
-    )
-    
-    # Concatenate: original audio + silence
-    padded = concatenate_audioclips([audio_clip, silence])
-    return padded
-    if hasattr(clip, "with_duration"):
-        return clip.with_duration(duration)
-    return clip.set_duration(duration)
-
-
-def _with_audio(clip, audio_clip):
-    if hasattr(clip, "with_audio"):
-        return clip.with_audio(audio_clip)
-    return clip.set_audio(audio_clip)
-
-
 def _resized(clip, factor):
     """resized() on MoviePy 2.x, resize() on 1.x. `factor` can be a number or a function of t."""
     if hasattr(clip, "resized"):
@@ -176,55 +118,56 @@ def _subclip(clip, start, end):
 
 
 def _pad_audio_with_silence(audio_clip, target_duration):
-    """Extend an audio clip to target_duration by concatenating silence at the end.
+    """Extend an audio clip to target_duration by concatenating real silence at the end.
     If audio is already longer than target_duration, trim it."""
     if audio_clip.duration >= target_duration:
-        # Trim to target if already longer
         return _subclip(audio_clip, 0, target_duration)
     
-    # Pad with silence
     silence_duration = target_duration - audio_clip.duration
-    from moviepy.audio.AudioClip import AudioClip
     
-    # Create silent audio clip
-    silence = AudioClip(
-        make_frame=lambda t: np.zeros((2,)),
-        duration=silence_duration,
-        fps=44100
-    )
+    try:
+        # Try MoviePy 2.x method
+        from moviepy.audio.AudioClip import AudioClip
+        silence = AudioClip.make_silence(silence_duration, fps=44100, nchannels=2)
+    except (TypeError, AttributeError):
+        # Fall back to 1.x method with lambda
+        from moviepy.audio.AudioClip import AudioClip
+        silence = AudioClip(
+            lambda t: np.zeros((2,)),
+            duration=silence_duration,
+            fps=44100
+        )
     
-    # Concatenate: original audio + silence
     padded = concatenate_audioclips([audio_clip, silence])
     return padded
 
 
 def _video_audio_with_dynamic_volume(video_audio, narration_duration, total_duration, ducked_volume):
-    """Split video audio into two sections:
-    - 0 to narration_duration: play at ducked_volume (under narration)
-    - narration_duration to total_duration: play at full volume (after narration ends)
-    
-    Returns a composite audio with these two sections layered."""
+    """Split video audio: ducked during narration (0 to narration_duration), 
+    full volume after (narration_duration to total_duration)."""
     if narration_duration >= total_duration:
-        # Narration covers the whole video — keep it ducked throughout
+        # Narration covers whole video — keep ducked throughout
         return _with_volume(video_audio, ducked_volume)
     
-    # Split original audio into two parts
-    narration_section = _subclip(video_audio, 0, narration_duration)
-    remaining_section = _subclip(video_audio, narration_duration, total_duration)
+    # Trim to total_duration first
+    video_trimmed = _subclip(video_audio, 0, total_duration)
     
-    # Apply volumes
-    narration_section_ducked = _with_volume(narration_section, ducked_volume)
-    remaining_section_full = _with_volume(remaining_section, 1.0)  # Full volume
+    # Split into two parts
+    narration_part = _subclip(video_trimmed, 0, narration_duration)
+    remaining_part = _subclip(video_trimmed, narration_duration, total_duration)
     
-    # Set start times and layer
-    narration_section_ducked = _with_start(narration_section_ducked, 0)
-    remaining_section_full = _with_start(remaining_section_full, narration_duration)
+    # Apply volumes and set start times
+    narration_part_ducked = _with_volume(narration_part, ducked_volume)
+    narration_part_ducked = _with_start(narration_part_ducked, 0)
     
-    # Composite them
-    dynamic_audio = CompositeAudioClip([narration_section_ducked, remaining_section_full])
-    dynamic_audio = _with_duration(dynamic_audio, total_duration)
+    remaining_part_full = _with_volume(remaining_part, 1.0)
+    remaining_part_full = _with_start(remaining_part_full, narration_duration)
     
-    return dynamic_audio
+    # Composite and set final duration
+    result = CompositeAudioClip([narration_part_ducked, remaining_part_full])
+    result = _with_duration(result, total_duration)
+    
+    return result
 
 
 KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
@@ -786,8 +729,14 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
             # No non-empty slots — create a silent 2-second audio placeholder
             # (build_video still needs something to work with)
             silent_path = os.path.join(TEMP_DIR, f"audio_silent_{index}.mp3")
-            from moviepy.audio.AudioClip import AudioClip
-            silent_clip = AudioClip(make_frame=lambda t: np.zeros((2,)), duration=2.0, fps=44100)
+            try:
+                # Try MoviePy 2.x method
+                from moviepy.audio.AudioClip import AudioClip
+                silent_clip = AudioClip.make_silence(2.0, fps=44100, nchannels=2)
+            except (TypeError, AttributeError):
+                # Fall back to 1.x method
+                from moviepy.audio.AudioClip import AudioClip
+                silent_clip = AudioClip(lambda t: np.zeros((2,)), duration=2.0, fps=44100)
             silent_clip.write_audiofile(silent_path, fps=44100, logger=None)
             silent_clip.close()
             audio_paths.append(silent_path)
