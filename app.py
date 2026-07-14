@@ -780,12 +780,16 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
 
             if is_video_file(image_path):
                 # User uploaded an actual video clip for this scene.
-                # NEW: Use the video's FULL original duration as the scene length.
-                # This means:
-                # - If video is longer than narration: narration plays once, then silence/original audio for the rest
-                # - If video is shorter than narration: loop the video to match narration length (keeps all speech audible)
                 raw_clip = VideoFileClip(image_path)
                 image_clips_to_close.append(raw_clip)
+                
+                # Apply speed adjustment if user set it (from slider)
+                video_speed = st.session_state.get(f"scene_video_speed_{index}", 1.0)
+                if video_speed != 1.0:
+                    try:
+                        raw_clip = raw_clip.speedx(video_speed)
+                    except (AttributeError, TypeError):
+                        pass  # If speedx fails, just use original
 
                 video_duration = raw_clip.duration
                 narration_duration = audio_clip.duration
@@ -800,7 +804,6 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                     duration = narration_duration
                 else:
                     # Video is longer than narration → use video's full length
-                    # Narration plays once, video continues with original audio/silence
                     duration = video_duration
 
                 segment_clip = _subclip(source_clip, 0, duration)
@@ -1135,6 +1138,12 @@ def main():
                         key=f"scene_video_audio_vol_{index}",
                         help="How loud this clip's own audio plays under your narration. "
                              "0 = mute the clip's audio, 1 = full volume. Narration stays prioritized.",
+                    )
+                    st.slider(
+                        "▶️ Video speed", 0.25, 2.0, 1.0, step=0.25,
+                        key=f"scene_video_speed_{index}",
+                        help="Slow down (0.25–0.75) or speed up (1.25–2.0) this video clip. "
+                             "1.0 = normal speed.",
                     )
 
             with col_dialogue:
