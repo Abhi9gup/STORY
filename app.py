@@ -352,32 +352,90 @@ SFX_VOLUME = 0.9             # SFX plays near-full volume as a short accent
 ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME = 0.3
 NARRATION_VOLUME_WHEN_MIXED = 1.15
 
-# Hindi/Hinglish keyword -> sound-cue tag map. Edit/extend this freely —
-# every pattern is matched (case-sensitive Devanagari) against each scene's
-# story text, and any hit auto-inserts the matching sound at that point.
+# Hindi/Hinglish keyword -> sound-cue tag map for Naagin series
 SOUND_KEYWORD_MAP = {
-    # --- पुराने साउंड्स ---
-    r"(हंसने|हंसा|मजाक|ठिठोली|खिलखिला)": "[sfx:laugh]",
-    r"(सांप|नाग|नागिन|फुंकार|डसने)": "[sfx:hiss]",
-    r"(बिजली|तूफान|बादल|गर्जना|कड़क)": "[sfx:thunder]",
-    r"(अचानक|चौंक|तभी|एकदम|पलक झपकते)": "[sfx:whoosh]",
-    r"(हवा|सन्नाटा|अंधेरा|जंगल|शमशान)": "[sfx:wind]",
-    r"(सोचा|बुद्धि|विचार|आइडिया|तरकीब)": "[sfx:ding]",
-
-    # --- नए साउंड्स (SFX) ---
-    r"(रोने|रोया|आंसू|सिसकने|विलाप|रोना)": "[sfx:crying]",
-    r"(डर|कांप|सहमा|खौफ|भयानक|भूत)": "[sfx:fear]",
-    r"(हांफने|हांफा|सांस फूल|थक)": "[sfx:panting]",
-    r"(शेर|दहाड़|सिंह|वनराज)": "[sfx:lion_roar]",
-    r"(कुत्ता|भोंकने|भौ-भौ|श्वान)": "[sfx:dog_bark]",
-    r"(बिल्ली|म्याऊ|म्यॉंऊ)": "[sfx:cat_meow]",
-    r"(भेड़िया|हुआँ|चीख)": "[sfx:wolf_howl]",
-    r"(दर्द|कराहा|चोट|आह|उफ्)": "[sfx:pain_groan]",
-
-    # --- म्यूजिक ट्रैक्स (BGM) ---
-    r"(प्यार|मोहब्बत|सुंदर|रूप|खूबसूरत|रोमांटिक)": "[bgm:love]",
-    r"(भगवान|शिव|मंदिर|पूजा|प्रार्थना|भक्ति|आशीर्वाद)": "[bgm:devotional]",
-    r"(रहस्य|राज|सस्पेंस|छुपा|खोज)": "[bgm:suspense]",
+    # ============ TEMPLE & SPIRITUAL ============
+    r"(मंदिर|मंदिर|पूजा|प्रार्थना|भगवान|देवता|महादेव|शिव|आशीर्वाद|पवित्र|पूजनीय|भक्ति)": "[sfx:temple_bells]",
+    r"(घंटी|घंटी|ध्वनि|शंख|शंखनाद|ॐ|ओम)": "[sfx:shankh_conch]",
+    r"(आत्मा|आत्मा|आध्यात्मिक|दिव्य|पवित्र|पवित्रता|देवी)": "[sfx:sacred_humming]",
+    r"(तांपूरा|तांपूरा|ध्रुव्य|सुर|संगीत)": "[sfx:tanpura_drone]",
+    
+    # ============ MYSTERY ============
+    r"(गुप्त|रहस्य|छुपा|राज|रहस्य|गूढ़|अज्ञात|भेद|छिपा)": "[sfx:mystery_whoosh]",
+    r"(गुफा|गुफा|गुप्त द्वार|दरवाज़ा|रहस्य द्वार|पुरातन)": "[sfx:stone_grinding]",
+    r"(भविष्यवाणी|भविष्य|भविष्यद्वाणी|पूर्वाभास|इशारा)": "[sfx:magical_echo]",
+    r"(प्राचीन|अति प्राचीन|पुरातत्व|ऐतिहासिक|पुरानी)": "[sfx:ancient_hum]",
+    
+    # ============ NAAG POWER ============
+    r"(नाग|नागिन|साँप|सर्प|फुंकार|डसना|जहर|विष|काटना)": "[sfx:snake_hiss]",
+    r"(शक्ति|नाग शक्ति|नागिन शक्ति|जागृत|जाग गई|शक्तिशाली|शक्तिमान)": "[sfx:energy_pulse]",
+    r"(नागमणि|हीरा|रत्न|चमकना|दीप्ति|प्रकाश|गहरा रंग)": "[sfx:emerald_glow]",
+    r"(ऊर्जा|शक्ति|चेतना|जीवन|प्रवाह|लहर|तरंग)": "[sfx:magical_energy]",
+    
+    # ============ NAAGLOK ============
+    r"(नागलोक|नाग दुनिया|नाग राज्य|स्वर्ग|दिव्य लोक|दूसरी दुनिया|अन्य लोक|परलोक)": "[sfx:mystical_choir]",
+    r"(क्रिस्टल|क्रिस्टल्स|पारदर्शी|चमकदार|दीप्तिमान|खनिज|रत्न)": "[sfx:crystal_ambience]",
+    r"(जलप्रपात|झरना|पानी|जल|बहना|प्रवाहित|बहती)": "[sfx:waterfall]",
+    r"(दिव्य|पवित्र|स्वर्गीय|ईश्वरीय|देवी|देव|परमात्मा)": "[sfx:divine_ambience]",
+    
+    # ============ KULGURU ============
+    r"(कुलगुरु|गुरु|शिक्षक|बुजुर्ग|ज्ञानी|ऋषि|तपस्वी|ज्ञान|सलाह)": "[sfx:kulguru_chant]",
+    r"(भारी|गंभीर|शक्तिशाली|प्रभावशाली|अधिकार|शक्ति)": "[sfx:heavy_bass_boom]",
+    
+    # ============ VILLAIN ============
+    r"(खलनायक|दुष्ट|बुरा|दुश्मन|शत्रु|वैर|प्रतिद्वंद्वी|अन्य नाग|विरोधी)": "[sfx:dark_drone]",
+    r"(फिसफिसाहट|गुप्त|छुपा|काला|अंधेरा|रात|भयानक)": "[sfx:evil_whisper]",
+    r"(तूफान|गर्जना|बिजली|वज्र|आसमान|बादल|कहर)": "[sfx:villain_thunder]",
+    r"(दिल की धड़कन|दिल|नाड़ी|स्पंद|तेज़)": "[sfx:heartbeat]",
+    r"(धातु|लोहा|स्टील|तीव्र|कठोर|भारी)": "[sfx:metallic_hit]",
+    
+    # ============ GARUDA ============
+    r"(गरुड़|उक्कब|चील|शिकारी पक्षी|पक्षी राज|आक्रमण|हमला|युद्ध)": "[sfx:eagle_scream]",
+    r"(पंख|पंखों की आवाज़|पंख फड़फड़ाना|उड़ना|हवा|आकाश)": "[sfx:wings_flapping]",
+    r"(तेज़ हवा|झोंका|गस्ट|हवा का झोंका|आंधी|तूफान)": "[sfx:wind_gust]",
+    r"(गिरना|गिरा|धड़ाम|जोर की आवाज़|प्रभाव|टकराव|टक्कर)": "[sfx:heavy_impact]",
+    r"(दहाड़|गर्जना|चीख|तीव्र आवाज़|शक्तिशाली|भयंकर)": "[sfx:roar]",
+    
+    # ============ ROMANCE (Myra & Veer) ============
+    r"(प्यार|मोहब्बत|प्रेम|चाहत|ख्वाहिश|दिल|हृदय|प्रिय|प्रियतम|पति)": "[bgm:love]",
+    r"(रोमांटिक|प्रेमपूर्ण|कोमल|नरम|मीठा|सुंदर|मनमोहक)": "[bgm:love]",
+    r"(मिरा|वीर|कपल|जोड़ा|दोनों|साथ|संग|एक दूसरे)": "[bgm:myra_love]",
+    
+    # ============ ACTION ============
+    r"(लड़ाई|संघर्ष|झगड़ा|मार|पिटाई|हमला|दंगा|युद्ध|विरोध)": "[sfx:punch]",
+    r"(आग|आग लगना|जलना|अग्नि|दहकना|प्रज्वलित)": "[sfx:fire]",
+    r"(विस्फोट|बम|फटना|धमाल|विस्फोटक|बिस्फोटन)": "[sfx:explosion]",
+    r"(तलवार|तलवार की आवाज़|ख़ंजर|शस्त्र|हथियार|काटना|पार करना)": "[sfx:sword_clash]",
+    r"(ऊर्जा किरण|शक्ति का विस्फोट|जादू|ताकत|शक्ति)": "[sfx:energy_blast]",
+    r"(धरती|जमीन|दरार|फटना|कंपन|झनझनाहट)": "[sfx:ground_crack]",
+    r"(मलबा|टुकड़े|उड़ना|भाग जाना|बिखरना)": "[sfx:flying_debris]",
+    
+    # ============ NAAGIN TRANSFORMATION (SIGNATURE SOUND) ============
+    r"(रूपांतर|बदल|नागिन बन|शक्ति जागृत|परिवर्तन|बदलाव|रूप बदल|मेटामॉर्फोसिस)": "[sfx:naagin_transform]",
+    r"(नागिन|नाग रूप|साँप का रूप|सर्प रूप|शक्तिशाली|जागृत)": "[sfx:naagin_transform]",
+    
+    # ============ NAAGMANI (ALWAYS SAME SOUND) ============
+    r"(नागमणि|मणि|रत्न|हीरा|जादुई|शक्तिशाली|अनमोल|अमूल्य)": "[sfx:naagmani_signature]",
+    
+    # ============ EMOTIONAL/SAD ============
+    r"(दुःख|गम|उदास|रुलाई|आँसू|दर्द|पीड़ा|तकलीफ|कष्ट|व्यथा)": "[bgm:emotional_sad]",
+    r"(अकेला|अकेली|अकेलेपन|अलग|दूर|विछोह|वियोग|बिछड़ना)": "[bgm:emotional_sad]",
+    r"(मृत्यु|मर|मरना|अंत|समाप्त|नष्ट|खत्म|जीवन)": "[bgm:emotional_sad]",
+    
+    # ============ FOREST ============
+    r"(जंगल|वन|वनस्पति|पेड़|पत्तियां|घास|वनचर|कानन|वनस्पति)": "[bgm:forest]",
+    r"(पक्षी|चिड़िया|कलरव|गीत|आवाज़|संगीत|चहचहाना)": "[sfx:forest_birds]",
+    r"(हवा|हवा का झोंका|बयार|सुगंध|ठंडक)": "[sfx:forest_wind]",
+    r"(नदी|जल|जलस्रोत|प्रवाह|गुड़गुड़ाहट)": "[sfx:river]",
+    r"(टिड्डी|टिड्डियों की आवाज़|रात|रात की आवाज़|छोटी आवाज़|गिड़गिड़ाहट)": "[sfx:crickets]",
+    r"(उल्लू|उल्लू की आवाज़|रात्रि|अंधेरा|शांति)": "[sfx:owl]",
+    
+    # ============ VILLAGE ============
+    r"(गाँव|ग्रामीण|देहाती|कस्बा|गाँव के|घर)": "[bgm:village]",
+    r"(गाय|गायों की आवाज़|पशु|गायब|डींक्ष|घंटी|मवेशी)": "[sfx:cow_bells]",
+    r"(बच्चे|बच्चों|खेल|खिलवाड़|हँसी|शोर|चहचहाहट)": "[sfx:children_voices]",
+    r"(बाज़ार|व्यापार|खरीद|बेच|दुकान|भीड़|लोग)": "[sfx:market_ambience]",
+    r"(पैर|चलना|कदम|पदचाप|आना|जाना|चलना फिरना)": "[sfx:footsteps]",
 }
 
 
@@ -765,6 +823,14 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
       the playback speed (0.25 = very slow, 1.0 = normal, 2.0 = very fast).
     Returns the path to the exported video file.
     """
+    # Initialize empty lists if not provided
+    if video_audio_volumes is None:
+        video_audio_volumes = []
+    if video_speeds is None:
+        video_speeds = []
+    
+    print(f"DEBUG: build_video called with {len(story_items)} scenes")
+    print(f"DEBUG: video_speeds = {video_speeds}")
     video_segments = []
     audio_clips_to_close = []
     image_clips_to_close = []
@@ -786,13 +852,21 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 image_clips_to_close.append(raw_clip)
                 
                 # Apply speed adjustment from user's slider setting
-                video_speed = video_speeds[index] if video_speeds and index < len(video_speeds) else 1.0
+                # Get speed from the passed list, with fallback to 1.0 (normal speed)
+                video_speed = 1.0
+                if video_speeds and index < len(video_speeds):
+                    video_speed = video_speeds[index]
+                
+                # Only apply speed if it's different from normal
                 if video_speed != 1.0:
                     try:
                         raw_clip = raw_clip.speedx(video_speed)
+                        print(f"✓ Applied speed {video_speed}x to video {index}")
                     except Exception as e:
                         # speedx failed, continue with original speed
-                        print(f"Warning: Could not apply speed {video_speed}x to video {index}: {e}")
+                        print(f"⚠ Warning: Could not apply speed {video_speed}x to video {index}: {e}")
+                else:
+                    print(f"ℹ Video {index} speed: normal (1.0x)")
 
                 video_duration = raw_clip.duration
                 narration_duration = audio_clip.duration
