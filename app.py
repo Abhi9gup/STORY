@@ -749,7 +749,7 @@ async def generate_all_audio(story_items, scene_voices, scene_styles, progress_c
 
 
 def build_video(story_items, audio_paths, progress_callback=None, motion_effect="random",
-                 motion_prompts=None, fal_key=None, video_audio_volumes=None):
+                 motion_prompts=None, fal_key=None, video_audio_volumes=None, video_speeds=None):
     """
     Build the final video by pairing each image with its corresponding audio clip.
     motion_effect:
@@ -761,6 +761,8 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
     video_audio_volumes: list aligned with story_items — for video-clip scenes,
       how loud the clip's OWN original audio plays under the narration
       (0.0 = mute it, 1.0 = full volume). Narration always stays prioritized.
+    video_speeds: list aligned with story_items — for video-clip scenes,
+      the playback speed (0.25 = very slow, 1.0 = normal, 2.0 = very fast).
     Returns the path to the exported video file.
     """
     video_segments = []
@@ -783,13 +785,14 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 raw_clip = VideoFileClip(image_path)
                 image_clips_to_close.append(raw_clip)
                 
-                # Apply speed adjustment if user set it (from slider)
-                video_speed = st.session_state.get(f"scene_video_speed_{index}", 1.0)
+                # Apply speed adjustment from user's slider setting
+                video_speed = video_speeds[index] if video_speeds and index < len(video_speeds) else 1.0
                 if video_speed != 1.0:
                     try:
                         raw_clip = raw_clip.speedx(video_speed)
-                    except (AttributeError, TypeError):
-                        pass  # If speedx fails, just use original
+                    except Exception as e:
+                        # speedx failed, continue with original speed
+                        print(f"Warning: Could not apply speed {video_speed}x to video {index}: {e}")
 
                 video_duration = raw_clip.duration
                 narration_duration = audio_clip.duration
@@ -1348,6 +1351,7 @@ def main():
                 setup_workspace()
                 story_items = []
                 video_audio_volumes = []
+                video_speeds = []
                 for index, uploaded_file in enumerate(uploaded_images):
                     image_path = save_uploaded_media(uploaded_file)
                     # Get the multi-slot dialogue for this scene
@@ -1357,8 +1361,11 @@ def main():
                     if is_video_file(uploaded_file.name):
                         vol = st.session_state.get(f"scene_video_audio_vol_{index}", ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME)
                         video_audio_volumes.append(vol)
+                        speed = st.session_state.get(f"scene_video_speed_{index}", 1.0)
+                        video_speeds.append(speed)
                     else:
                         video_audio_volumes.append(0)  # not a video, doesn't matter
+                        video_speeds.append(1.0)  # no speed change for images
 
             # Audio generation now handles multiple dialogue slots per scene
             audio_progress = st.progress(0, text="Starting audio generation...")
@@ -1406,6 +1413,7 @@ def main():
                     motion_prompts=motion_prompts,
                     fal_key=fal_key_input,
                     video_audio_volumes=video_audio_volumes,
+                    video_speeds=video_speeds,
                 )
 
             video_progress.progress(1.0, text="Video assembly complete ✅")
