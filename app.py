@@ -709,7 +709,7 @@ def main():
         st.title("🔒 Access Restricted")
         password_input = st.text_input("Enter Password to Unlock App", type="password")
         if st.button("Unlock Interface"):
-            if password_input == "your_password_here":   # Change your application password target here
+            if password_input == "9161787448":   # Change your application password target here
                 st.session_state.authenticated = True
                 st.rerun()
             else:
