@@ -852,58 +852,83 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 image_clips_to_close.append(raw_clip)
                 
                 original_duration = raw_clip.duration
+                original_fps = raw_clip.fps
                 
                 # Get speed from slider
                 video_speed = 1.0
                 if video_speeds and index < len(video_speeds):
                     video_speed = video_speeds[index]
                 
-                print(f"DEBUG: Video {index} - Original: {original_duration:.2f}s, Speed: {video_speed}x")
+                print(f"DEBUG: Video {index} - Original: {original_duration:.2f}s @ {original_fps}fps, Speed: {video_speed}x")
                 
-                # Calculate what the duration WILL BE after speed adjustment
-                # 0.5x speed = 2x longer
-                # 2.0x speed = 0.5x shorter
+                # Calculate expected duration after speed change
                 new_duration_after_speed = original_duration / video_speed
-                
                 narration_duration = audio_clip.duration
                 
-                print(f"After speed: {new_duration_after_speed:.2f}s, Narration: {narration_duration:.2f}s")
-                
-                # Apply speed adjustment using speedx()
                 source_clip = raw_clip
+                
+                # Apply speed by changing FPS directly (more reliable than speedx)
                 if video_speed != 1.0:
                     try:
+                        # Method 1: Try speedx() first
                         source_clip = raw_clip.speedx(video_speed)
-                        actual_new_duration = source_clip.duration
-                        print(f"✓ Speed {video_speed}x applied: {original_duration:.2f}s → {actual_new_duration:.2f}s")
-                    except Exception as e:
-                        print(f"⚠ speedx failed: {e}")
-                        source_clip = raw_clip
-                        video_speed = 1.0  # Reset to 1.0 if speedx fails
-                        new_duration_after_speed = original_duration
-                
-                # Determine final duration based on comparison
-                if new_duration_after_speed >= narration_duration:
-                    # Slowed video is long enough - NO LOOP
-                    duration = new_duration_after_speed
-                    print(f"✓ NO LOOP: {new_duration_after_speed:.2f}s ≥ {narration_duration:.2f}s")
+                        actual_duration = source_clip.duration
+                        print(f"✓ speedx({video_speed}x) worked: {original_duration:.2f}s → {actual_duration:.2f}s")
+                    except:
+                        try:
+                            # Method 2: Change FPS directly
+                            # Lower FPS = slower playback
+                            # If speed is 0.5x, use half the FPS
+                            new_fps = original_fps * video_speed
+                            
+                            # Create a new clip with modified FPS
+                            source_clip = raw_clip.set_fps(new_fps)
+                            actual_duration = source_clip.duration
+                            print(f"✓ FPS method: {original_fps}fps → {new_fps}fps, duration: {original_duration:.2f}s → {actual_duration:.2f}s")
+                        except:
+                            try:
+                                # Method 3: Use speedx with inverted speed
+                                source_clip = raw_clip.speedx(1.0 / video_speed)
+                                actual_duration = source_clip.duration
+                                print(f"✓ Inverted speedx(1/{video_speed}x) worked: {original_duration:.2f}s → {actual_duration:.2f}s")
+                            except Exception as e:
+                                print(f"⚠ All speed methods failed: {e}")
+                                source_clip = raw_clip
+                                video_speed = 1.0
+                                actual_duration = original_duration
                 else:
-                    # Even after slowing down, still shorter than narration
-                    # Only loop if speed was NOT applied (speed == 1.0)
+                    actual_duration = original_duration
+                    print(f"ℹ Video {index}: normal speed (1.0x)")
+
+                # Use actual duration from speedx, or calculated if it failed
+                video_duration = actual_duration if 'actual_duration' in locals() else new_duration_after_speed
+                
+                print(f"Final check: Video {video_duration:.2f}s vs Narration {narration_duration:.2f}s")
+
+                if video_duration >= narration_duration:
+                    # Video is long enough - NO LOOP
+                    duration = video_duration
+                    print(f"✓ NO LOOP: {video_duration:.2f}s ≥ {narration_duration:.2f}s")
+                else:
+                    # Video still short
                     if video_speed == 1.0:
-                        # Normal speed and still too short - must loop
+                        # Normal speed - must loop
                         loops_needed = int(narration_duration // original_duration) + 1
-                        print(f"ℹ LOOPING: speed=1.0x, video {original_duration:.2f}s < narration {narration_duration:.2f}s, loops={loops_needed}")
+                        print(f"ℹ LOOPING: speed=1.0x, loops needed={loops_needed}")
                         looped = concatenate_videoclips([source_clip] * loops_needed, method="compose")
                         image_clips_to_close.append(looped)
                         source_clip = looped
                         duration = narration_duration
                     else:
-                        # Speed was applied but still short - don't loop, just use what we have
-                        duration = new_duration_after_speed
-                        print(f"✓ Speed applied but short: using {new_duration_after_speed:.2f}s (no loop)")
+                        # Speed was applied but still short - don't loop
+                        duration = video_duration
+                        print(f"✓ NO LOOP (speed applied): {video_duration:.2f}s (will end before narration)")
 
-                segment_clip = _subclip(source_clip, 0, duration)
+                # Use source_clip directly - if speedx() was applied, it has the correct duration
+                # Don't subclip because it will undo the speedx() effect
+                segment_clip = source_clip
+                segment_duration = segment_clip.duration  # Get the ACTUAL duration after speed adjustment
+                print(f"✓ Segment clip duration: {segment_duration:.2f}s (video_speed={video_speed}x)")
 
                 # Handle audio: narration + video's original audio
                 original_audio = segment_clip.audio  # None if the clip is silent
@@ -913,23 +938,24 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                     else ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME
                 )
 
-                # Pad or trim narration to match final segment duration
-                if narration_duration < duration:
+                # Pad or trim narration to match ACTUAL segment duration (after speed adjustment)
+                if narration_duration < segment_duration:
                     # Video is longer → pad narration with silence at the end
-                    narration_to_mix = _pad_audio_with_silence(audio_clip, duration)
+                    narration_to_mix = _pad_audio_with_silence(audio_clip, segment_duration)
+                    print(f"✓ Padded audio from {narration_duration:.2f}s to {segment_duration:.2f}s")
                 else:
-                    # Narration is same or longer → trim to duration
-                    narration_to_mix = _subclip(audio_clip, 0, duration)
+                    # Narration is same or longer → trim to segment duration
+                    narration_to_mix = _subclip(audio_clip, 0, segment_duration)
+                    print(f"ℹ Trimmed audio from {narration_duration:.2f}s to {segment_duration:.2f}s")
 
                 if original_audio is not None and video_vol > 0:
                     # Mix video's original audio + narration
-                    # Video audio is ducked during narration, full volume after
                     dynamic_video_audio = _video_audio_with_dynamic_volume(
-                        original_audio, narration_duration, duration, video_vol
+                        original_audio, narration_duration, segment_duration, video_vol
                     )
                     narration_boosted = _with_volume(narration_to_mix, NARRATION_VOLUME_WHEN_MIXED)
                     combined_audio = CompositeAudioClip([dynamic_video_audio, narration_boosted])
-                    combined_audio = _pad_audio_with_silence(combined_audio, duration)
+                    combined_audio = _pad_audio_with_silence(combined_audio, segment_duration)
                     segment_clip = _with_audio(segment_clip, combined_audio)
                     audio_clips_to_close.append(combined_audio)
                 else:
