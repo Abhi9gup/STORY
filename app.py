@@ -40,6 +40,7 @@ try:
     from moviepy.editor import (
         ImageClip,
         AudioFileClip,
+        AudioClip,
         VideoFileClip,
         CompositeVideoClip,
         CompositeAudioClip,
@@ -50,6 +51,7 @@ except ModuleNotFoundError:
     from moviepy import (
         ImageClip,
         AudioFileClip,
+        AudioClip,
         VideoFileClip,
         CompositeVideoClip,
         CompositeAudioClip,
@@ -92,6 +94,15 @@ def _subclip(clip, start, end):
     if hasattr(clip, "subclipped"):
         return clip.subclipped(start, end)
     return clip.subclip(start, end)
+
+
+DIALOGUE_PAUSE_SECONDS = 0.35  # short beat of silence between dialogue lines in a scene
+
+
+def _silence(duration_seconds, fps=44100):
+    """A silent AudioClip of the given length, used as a natural pause between
+    two characters' dialogue lines within the same scene."""
+    return AudioClip(lambda t: 0, duration=duration_seconds, fps=fps)
 KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
 def apply_ken_burns(image_clip, duration, effect=None, zoom_ratio=1.18):
     """
@@ -483,32 +494,70 @@ def mix_scene_audio(narration_path: str, cues: list, output_path: str, scene_dur
         except Exception:
             pass
     return output_path
-async def generate_all_audio(story_items, scene_voices, scene_styles, progress_callback=None):
+async def generate_all_audio(story_items, progress_callback=None):
     """
-    Generate TTS audio sequentially for every (image_path, text) pair, then
-    auto-detect and mix in any SFX/BGM cues found in that scene's text.
-    scene_voices: list of voice IDs, one per scene (per-scene voice choice).
-    scene_styles: list of (rate, pitch) tuples, one per scene.
+    Generate TTS audio for every scene, where each scene can have MULTIPLE
+    dialogue lines, each with its own voice — e.g. Ram's line in one voice,
+    Sita's line in another, within the same picture/video.
+
+    story_items: list of (image_path, dialogue_lines) where dialogue_lines is
+    a list of (text, voice, rate_str, pitch_str) tuples for that scene, in
+    speaking order. A single-speaker scene just has one entry in the list.
+
+    Each line is synthesized separately (so each can have its own voice/style),
+    then stitched together with a short pause between speakers into one audio
+    file per scene. SFX/BGM cues are detected per line and time-aligned using
+    edge-tts's own word-boundary data, then offset by that line's position in
+    the stitched track, so cues still land at the right moment even with
+    multiple speakers.
+
     Returns (audio_paths, scene_cues) — audio_paths aligned with story_items
-    order (ready to hand straight to build_video), and scene_cues (the
+    order (ready to hand straight to build_video), and scene_cues (all
     detected cues per scene, for showing the user what was auto-added).
     """
     audio_paths = []
     scene_cues = []
     total = len(story_items)
-    for index, (_, text) in enumerate(story_items):
-        voice = scene_voices[index]
-        rate, pitch = scene_styles[index]
-        raw_audio_path = os.path.join(TEMP_DIR, f"audio_raw_{index}.mp3")
-        boundaries = await generate_audio_file(text, voice, raw_audio_path, rate=rate, pitch=pitch)
-        cues = find_sound_cues(text)
-        _align_cues_to_audio(text, boundaries, cues)
-        scene_cues.append(cues)
-        with AudioFileClip(raw_audio_path) as probe:
-            scene_duration = probe.duration
+    for index, (_, dialogue_lines) in enumerate(story_items):
+        line_clips = []
+        combined_cues = []
+        cumulative_offset = 0.0
+
+        for line_index, (line_text, line_voice, rate, pitch) in enumerate(dialogue_lines):
+            line_path = os.path.join(TEMP_DIR, f"audio_{index}_line{line_index}.mp3")
+            boundaries = await generate_audio_file(line_text, line_voice, line_path, rate=rate, pitch=pitch)
+
+            line_cues = find_sound_cues(line_text)
+            _align_cues_to_audio(line_text, boundaries, line_cues)
+            for cue in line_cues:
+                cue["audio_time"] = cue.get("audio_time", 0.0) + cumulative_offset
+            combined_cues.extend(line_cues)
+
+            line_clip = AudioFileClip(line_path)
+            line_clips.append(line_clip)
+            cumulative_offset += line_clip.duration
+
+            if line_index < len(dialogue_lines) - 1:
+                pause_clip = _silence(DIALOGUE_PAUSE_SECONDS)
+                line_clips.append(pause_clip)
+                cumulative_offset += DIALOGUE_PAUSE_SECONDS
+
+        raw_scene_clip = concatenate_audioclips(line_clips)
+        raw_scene_path = os.path.join(TEMP_DIR, f"audio_raw_{index}.mp3")
+        raw_scene_clip.write_audiofile(raw_scene_path, fps=44100, logger=None)
+        scene_duration = raw_scene_clip.duration
+        raw_scene_clip.close()
+        for c in line_clips:
+            try:
+                c.close()
+            except Exception:
+                pass
+
         mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
-        final_path = mix_scene_audio(raw_audio_path, cues, mixed_path, scene_duration)
+        final_path = mix_scene_audio(raw_scene_path, combined_cues, mixed_path, scene_duration)
         audio_paths.append(final_path)
+        scene_cues.append(combined_cues)
+
         if progress_callback:
             progress_callback((index + 1) / total, f"Generating audio {index + 1}/{total}...")
     return audio_paths, scene_cues
@@ -781,7 +830,8 @@ def main():
             "are flagged so you know what to add."
         )
         # Optional convenience: bulk-paste a whole script at once, split by blank lines,
-        # and auto-fill each picture's text box in order.
+        # and auto-fill each picture's FIRST dialogue line in order. For multi-speaker
+        # scenes, add the extra lines individually below.
         with st.expander("✏️ Optional: paste the whole story at once (split by blank lines)"):
             bulk_text = st.text_area(
                 "Paste your full story here — separate each picture's sentence with a blank line",
@@ -796,7 +846,7 @@ def main():
             if apply_bulk and bulk_text.strip():
                 chunks = [c.strip() for c in bulk_text.split("\n\n") if c.strip()]
                 for i, chunk in enumerate(chunks[: len(uploaded_images)]):
-                    st.session_state[f"story_text_{i}"] = chunk
+                    st.session_state[f"story_text_{i}_0"] = chunk
         VOICE_STYLE_PRESETS = {
             "Natural (no change)": (0, 0),
             "Deep & Slow (serious/dramatic)": (-20, -15),
@@ -804,14 +854,15 @@ def main():
             "Warm & Soft": (-10, 5),
             "Bright & Fast (excited)": (15, 15),
         }
-        def _apply_voice_preset(scene_index):
-            preset_name = st.session_state.get(f"scene_style_preset_{scene_index}")
+        def _apply_voice_preset(scene_index, line_index):
+            preset_name = st.session_state.get(f"story_style_preset_{scene_index}_{line_index}")
             if preset_name in VOICE_STYLE_PRESETS:
                 rate, pitch = VOICE_STYLE_PRESETS[preset_name]
-                st.session_state[f"scene_rate_{scene_index}"] = rate
-                st.session_state[f"scene_pitch_{scene_index}"] = pitch
-        # One row per scene: thumbnail/video preview + its own text area, voice,
-        # style, and a live preview of any sound cues auto-detected in the text.
+                st.session_state[f"story_rate_{scene_index}_{line_index}"] = rate
+                st.session_state[f"story_pitch_{scene_index}_{line_index}"] = pitch
+        # One block per scene: thumbnail/video preview + one or more dialogue
+        # lines, each with its own voice/style — e.g. Ram's line in one voice,
+        # Sita's line in another, both within the same picture.
         for index, uploaded_file in enumerate(uploaded_images):
             col1, col2 = st.columns([1, 2])
             with col1:
@@ -821,33 +872,60 @@ def main():
                 else:
                     st.image(uploaded_file, caption=uploaded_file.name, use_container_width=True)
             with col2:
-                st.text_area(
-                    f"Story text for scene {index + 1}",
-                    key=f"story_text_{index}",
-                    height=120,
-                    placeholder="Write or paste the sentence that goes with this scene...",
+                num_lines = st.session_state.get(f"num_lines_{index}", 1)
+                st.caption(
+                    f"**Scene {index + 1}** — {num_lines} dialogue line"
+                    f"{'s' if num_lines != 1 else ''}. Add more for multiple speakers "
+                    "in this same scene (e.g. Ram, then Sita)."
                 )
-                scene_voice_label = st.selectbox(
-                    f"Voice for scene {index + 1}",
-                    options=voice_labels,
-                    index=default_voice_index,
-                    key=f"scene_voice_label_{index}",
+                for line_i in range(num_lines):
+                    line_cols = st.columns([2, 1])
+                    with line_cols[0]:
+                        st.text_area(
+                            f"Line {line_i + 1} — scene {index + 1}",
+                            key=f"story_text_{index}_{line_i}",
+                            height=90,
+                            placeholder=(
+                                "e.g. राम ने कहा, 'चलो चलते हैं'"
+                                if line_i > 0 or num_lines > 1
+                                else "Write or paste the sentence that goes with this scene..."
+                            ),
+                        )
+                    with line_cols[1]:
+                        st.selectbox(
+                            f"Voice — line {line_i + 1}",
+                            options=voice_labels,
+                            index=default_voice_index,
+                            key=f"story_voice_{index}_{line_i}",
+                        )
+                        with st.expander("🎙️ Style", expanded=False):
+                            st.selectbox(
+                                "Preset",
+                                options=list(VOICE_STYLE_PRESETS.keys()),
+                                key=f"story_style_preset_{index}_{line_i}",
+                                on_change=_apply_voice_preset,
+                                args=(index, line_i),
+                            )
+                            st.slider("Rate", -50, 50, 0, step=5, key=f"story_rate_{index}_{line_i}")
+                            st.slider("Pitch", -50, 50, 0, step=5, key=f"story_pitch_{index}_{line_i}")
+
+                btn_cols = st.columns(2)
+                with btn_cols[0]:
+                    if st.button(f"➕ Add another speaker/line", key=f"add_line_{index}"):
+                        st.session_state[f"num_lines_{index}"] = num_lines + 1
+                        st.rerun()
+                with btn_cols[1]:
+                    if num_lines > 1 and st.button(f"➖ Remove last line", key=f"remove_line_{index}"):
+                        last = num_lines - 1
+                        for suffix in ("story_text", "story_voice", "story_style_preset", "story_rate", "story_pitch"):
+                            st.session_state.pop(f"{suffix}_{index}_{last}", None)
+                        st.session_state[f"num_lines_{index}"] = last
+                        st.rerun()
+
+                combined_scene_text = " ".join(
+                    st.session_state.get(f"story_text_{index}_{li}", "") for li in range(num_lines)
                 )
-                with st.expander("🎙️ Fine-tune expressiveness (optional)"):
-                    st.caption("Push rate/pitch for a more animated, 'vocal' delivery on dramatic lines.")
-                    st.selectbox(
-                        "Style preset",
-                        options=list(VOICE_STYLE_PRESETS.keys()),
-                        key=f"scene_style_preset_{index}",
-                        on_change=_apply_voice_preset,
-                        args=(index,),
-                    )
-                    st.slider("Speaking rate", -50, 50, 0, step=5, key=f"scene_rate_{index}",
-                               help="Negative = slower/more dramatic, positive = faster/more excited")
-                    st.slider("Pitch", -50, 50, 0, step=5, key=f"scene_pitch_{index}",
-                               help="Negative = deeper, positive = higher/brighter")
-                scene_text = st.session_state.get(f"story_text_{index}", "")
-                scene_cues_preview = find_sound_cues(scene_text) if scene_text.strip() else []
+                scene_cues_preview = find_sound_cues(combined_scene_text) if combined_scene_text.strip() else []
                 if scene_cues_preview:
                     bits = []
                     seen = set()
@@ -942,13 +1020,16 @@ def main():
             return
         missing_text_indexes = [
             i for i in range(len(uploaded_images))
-            if not st.session_state.get(f"story_text_{i}", "").strip()
+            if not any(
+                st.session_state.get(f"story_text_{i}_{li}", "").strip()
+                for li in range(st.session_state.get(f"num_lines_{i}", 1))
+            )
         ]
         if missing_text_indexes:
             missing_names = ", ".join(
                 uploaded_images[i].name for i in missing_text_indexes
             )
-            st.error(f"❌ Please add story text for: {missing_names}")
+            st.error(f"❌ Please add at least one dialogue line for: {missing_names}")
             return
         if selected_motion_effect == "ai_motion":
             if not FAL_CLIENT_AVAILABLE:
@@ -961,23 +1042,30 @@ def main():
             with st.spinner("Setting up workspace..."):
                 setup_workspace()
                 story_items = []
-                scene_voices = []
-                scene_styles = []
                 for index, uploaded_file in enumerate(uploaded_images):
                     image_path = save_uploaded_media(uploaded_file)
-                    text = st.session_state[f"story_text_{index}"].strip()
-                    story_items.append((image_path, text))
-                    scene_voice_label = st.session_state.get(f"scene_voice_label_{index}", default_voice_label)
-                    scene_voices.append(voice_options.get(scene_voice_label, selected_voice))
-                    rate_pct = st.session_state.get(f"scene_rate_{index}", 0)
-                    pitch_hz = st.session_state.get(f"scene_pitch_{index}", 0)
-                    scene_styles.append((f"{rate_pct:+d}%", f"{pitch_hz:+d}Hz"))
+                    num_lines = st.session_state.get(f"num_lines_{index}", 1)
+                    dialogue_lines = []
+                    for line_i in range(num_lines):
+                        line_text = st.session_state.get(f"story_text_{index}_{line_i}", "").strip()
+                        if not line_text:
+                            continue  # skip empty lines rather than sending blank audio
+                        line_voice_label = st.session_state.get(
+                            f"story_voice_{index}_{line_i}", default_voice_label
+                        )
+                        line_voice = voice_options.get(line_voice_label, selected_voice)
+                        rate_pct = st.session_state.get(f"story_rate_{index}_{line_i}", 0)
+                        pitch_hz = st.session_state.get(f"story_pitch_{index}_{line_i}", 0)
+                        dialogue_lines.append(
+                            (line_text, line_voice, f"{rate_pct:+d}%", f"{pitch_hz:+d}Hz")
+                        )
+                    story_items.append((image_path, dialogue_lines))
             # ---------------- Audio Generation (+ auto SFX/BGM mixing) ----------------
             audio_progress = st.progress(0, text="Starting audio generation...")
             def audio_progress_callback(fraction, message):
                 audio_progress.progress(fraction, text=message)
             audio_paths, scene_cues = asyncio.run(
-                generate_all_audio(story_items, scene_voices, scene_styles, audio_progress_callback)
+                generate_all_audio(story_items, audio_progress_callback)
             )
             audio_progress.progress(1.0, text="Audio generation complete ✅")
             # Let the user know which auto-detected sounds actually got mixed in
