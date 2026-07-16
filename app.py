@@ -20,7 +20,6 @@ import random
 import asyncio
 import traceback
 import requests
-import numpy as np
 
 # fal_client is optional — only needed if the user turns on AI Full Motion.
 # The rest of the app works fine without it installed.
@@ -68,36 +67,19 @@ except ModuleNotFoundError:
 # MoviePy 2.x renamed several clip methods (set_duration -> with_duration,
 # set_audio -> with_audio). These small helpers call whichever one exists,
 # so the app works on both MoviePy 1.x and 2.x.
-def _multiply_speed(clip, factor):
-    """
-    Safely adjusts the playback speed of a video clip across MoviePy versions.
-    This is more reliable than speedx() alone.
-    """
-    if factor == 1.0:
-        return clip
-        
-    # MoviePy 2.x approach
-    if hasattr(clip, "with_effects"):
-        try:
-            from moviepy.video.fx import MultiplySpeed
-            return clip.with_effects([MultiplySpeed(factor)])
-        except Exception:
-            pass
-    
-    # MoviePy 1.x approach
-    if hasattr(clip, "fx"):
-        try:
-            import moviepy.video.fx.all as vfx
-            return clip.fx(vfx.speedx, factor)
-        except Exception:
-            pass
-        
-    # Fallback: manually recalculate duration
-    try:
-        new_duration = clip.duration / factor
-        return _with_duration(clip, new_duration)
-    except Exception:
-        return clip
+def _with_duration(clip, duration):
+    if hasattr(clip, "with_duration"):
+        return clip.with_duration(duration)
+    return clip.set_duration(duration)
+
+
+def _with_audio(clip, audio_clip):
+    if hasattr(clip, "with_audio"):
+        return clip.with_audio(audio_clip)
+    return clip.set_audio(audio_clip)
+
+
+def _resized(clip, factor):
     """resized() on MoviePy 2.x, resize() on 1.x. `factor` can be a number or a function of t."""
     if hasattr(clip, "resized"):
         return clip.resized(factor)
@@ -125,78 +107,11 @@ def _with_volume(clip, factor):
     return clip.volumex(factor)
 
 
-def _with_duration(clip, duration):
-    """with_duration() on MoviePy 2.x, set_duration() on 1.x."""
-    if hasattr(clip, "with_duration"):
-        return clip.with_duration(duration)
-    return clip.set_duration(duration)
-
-
-def _with_audio(clip, audio_clip):
-    """with_audio() on MoviePy 2.x, set_audio() on 1.x."""
-    if hasattr(clip, "with_audio"):
-        return clip.with_audio(audio_clip)
-    return clip.set_audio(audio_clip)
-
-
 def _subclip(clip, start, end):
     """subclipped() on MoviePy 2.x, subclip() on 1.x."""
     if hasattr(clip, "subclipped"):
         return clip.subclipped(start, end)
     return clip.subclip(start, end)
-
-
-def _pad_audio_with_silence(audio_clip, target_duration):
-    """Extend an audio clip to target_duration by concatenating real silence at the end.
-    If audio is already longer than target_duration, trim it."""
-    if audio_clip.duration >= target_duration:
-        return _subclip(audio_clip, 0, target_duration)
-    
-    silence_duration = target_duration - audio_clip.duration
-    
-    try:
-        # Try MoviePy 2.x method
-        from moviepy.audio.AudioClip import AudioClip
-        silence = AudioClip.make_silence(silence_duration, fps=44100, nchannels=2)
-    except (TypeError, AttributeError):
-        # Fall back to 1.x method with lambda
-        from moviepy.audio.AudioClip import AudioClip
-        silence = AudioClip(
-            lambda t: np.zeros((2,)),
-            duration=silence_duration,
-            fps=44100
-        )
-    
-    padded = concatenate_audioclips([audio_clip, silence])
-    return padded
-
-
-def _video_audio_with_dynamic_volume(video_audio, narration_duration, total_duration, ducked_volume):
-    """Split video audio: ducked during narration (0 to narration_duration), 
-    full volume after (narration_duration to total_duration)."""
-    if narration_duration >= total_duration:
-        # Narration covers whole video — keep ducked throughout
-        return _with_volume(video_audio, ducked_volume)
-    
-    # Trim to total_duration first
-    video_trimmed = _subclip(video_audio, 0, total_duration)
-    
-    # Split into two parts
-    narration_part = _subclip(video_trimmed, 0, narration_duration)
-    remaining_part = _subclip(video_trimmed, narration_duration, total_duration)
-    
-    # Apply volumes and set start times
-    narration_part_ducked = _with_volume(narration_part, ducked_volume)
-    narration_part_ducked = _with_start(narration_part_ducked, 0)
-    
-    remaining_part_full = _with_volume(remaining_part, 1.0)
-    remaining_part_full = _with_start(remaining_part_full, narration_duration)
-    
-    # Composite and set final duration
-    result = CompositeAudioClip([narration_part_ducked, remaining_part_full])
-    result = _with_duration(result, total_duration)
-    
-    return result
 
 
 KEN_BURNS_EFFECTS = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
@@ -375,96 +290,32 @@ SFX_MAX_SECONDS = 4          # one-shot stings are trimmed to this length
 BGM_VOLUME = 0.22            # BGM plays quietly under the narration
 SFX_VOLUME = 0.9             # SFX plays near-full volume as a short accent
 
-# When a scene is an uploaded VIDEO clip that already has its own sound:
-# duck the clip's original audio down and slightly boost the narration on
-# top of it, so both are audible but the story text stays the clear focus.
-ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME = 0.3
-NARRATION_VOLUME_WHEN_MIXED = 1.15
-
-# Hindi/Hinglish keyword -> sound-cue tag map for Naagin series
+# Hindi/Hinglish keyword -> sound-cue tag map. Edit/extend this freely —
+# every pattern is matched (case-sensitive Devanagari) against each scene's
+# story text, and any hit auto-inserts the matching sound at that point.
 SOUND_KEYWORD_MAP = {
-    # ============ TEMPLE & SPIRITUAL ============
-    r"(मंदिर|मंदिर|पूजा|प्रार्थना|भगवान|देवता|महादेव|शिव|आशीर्वाद|पवित्र|पूजनीय|भक्ति)": "[sfx:temple_bells]",
-    r"(घंटी|घंटी|ध्वनि|शंख|शंखनाद|ॐ|ओम)": "[sfx:shankh_conch]",
-    r"(आत्मा|आत्मा|आध्यात्मिक|दिव्य|पवित्र|पवित्रता|देवी)": "[sfx:sacred_humming]",
-    r"(तांपूरा|तांपूरा|ध्रुव्य|सुर|संगीत)": "[sfx:tanpura_drone]",
-    
-    # ============ MYSTERY ============
-    r"(गुप्त|रहस्य|छुपा|राज|रहस्य|गूढ़|अज्ञात|भेद|छिपा)": "[sfx:mystery_whoosh]",
-    r"(गुफा|गुफा|गुप्त द्वार|दरवाज़ा|रहस्य द्वार|पुरातन)": "[sfx:stone_grinding]",
-    r"(भविष्यवाणी|भविष्य|भविष्यद्वाणी|पूर्वाभास|इशारा)": "[sfx:magical_echo]",
-    r"(प्राचीन|अति प्राचीन|पुरातत्व|ऐतिहासिक|पुरानी)": "[sfx:ancient_hum]",
-    
-    # ============ NAAG POWER ============
-    r"(नाग|नागिन|साँप|सर्प|फुंकार|डसना|जहर|विष|काटना)": "[sfx:snake_hiss]",
-    r"(शक्ति|नाग शक्ति|नागिन शक्ति|जागृत|जाग गई|शक्तिशाली|शक्तिमान)": "[sfx:energy_pulse]",
-    r"(नागमणि|हीरा|रत्न|चमकना|दीप्ति|प्रकाश|गहरा रंग)": "[sfx:emerald_glow]",
-    r"(ऊर्जा|शक्ति|चेतना|जीवन|प्रवाह|लहर|तरंग)": "[sfx:magical_energy]",
-    
-    # ============ NAAGLOK ============
-    r"(नागलोक|नाग दुनिया|नाग राज्य|स्वर्ग|दिव्य लोक|दूसरी दुनिया|अन्य लोक|परलोक)": "[sfx:mystical_choir]",
-    r"(क्रिस्टल|क्रिस्टल्स|पारदर्शी|चमकदार|दीप्तिमान|खनिज|रत्न)": "[sfx:crystal_ambience]",
-    r"(जलप्रपात|झरना|पानी|जल|बहना|प्रवाहित|बहती)": "[sfx:waterfall]",
-    r"(दिव्य|पवित्र|स्वर्गीय|ईश्वरीय|देवी|देव|परमात्मा)": "[sfx:divine_ambience]",
-    
-    # ============ KULGURU ============
-    r"(कुलगुरु|गुरु|शिक्षक|बुजुर्ग|ज्ञानी|ऋषि|तपस्वी|ज्ञान|सलाह)": "[sfx:kulguru_chant]",
-    r"(भारी|गंभीर|शक्तिशाली|प्रभावशाली|अधिकार|शक्ति)": "[sfx:heavy_bass_boom]",
-    
-    # ============ VILLAIN ============
-    r"(खलनायक|दुष्ट|बुरा|दुश्मन|शत्रु|वैर|प्रतिद्वंद्वी|अन्य नाग|विरोधी)": "[sfx:dark_drone]",
-    r"(फिसफिसाहट|गुप्त|छुपा|काला|अंधेरा|रात|भयानक)": "[sfx:evil_whisper]",
-    r"(तूफान|गर्जना|बिजली|वज्र|आसमान|बादल|कहर)": "[sfx:villain_thunder]",
-    r"(दिल की धड़कन|दिल|नाड़ी|स्पंद|तेज़)": "[sfx:heartbeat]",
-    r"(धातु|लोहा|स्टील|तीव्र|कठोर|भारी)": "[sfx:metallic_hit]",
-    
-    # ============ GARUDA ============
-    r"(गरुड़|उक्कब|चील|शिकारी पक्षी|पक्षी राज|आक्रमण|हमला|युद्ध)": "[sfx:eagle_scream]",
-    r"(पंख|पंखों की आवाज़|पंख फड़फड़ाना|उड़ना|हवा|आकाश)": "[sfx:wings_flapping]",
-    r"(तेज़ हवा|झोंका|गस्ट|हवा का झोंका|आंधी|तूफान)": "[sfx:wind_gust]",
-    r"(गिरना|गिरा|धड़ाम|जोर की आवाज़|प्रभाव|टकराव|टक्कर)": "[sfx:heavy_impact]",
-    r"(दहाड़|गर्जना|चीख|तीव्र आवाज़|शक्तिशाली|भयंकर)": "[sfx:roar]",
-    
-    # ============ ROMANCE (Myra & Veer) ============
-    r"(प्यार|मोहब्बत|प्रेम|चाहत|ख्वाहिश|दिल|हृदय|प्रिय|प्रियतम|पति)": "[bgm:love]",
-    r"(रोमांटिक|प्रेमपूर्ण|कोमल|नरम|मीठा|सुंदर|मनमोहक)": "[bgm:love]",
-    r"(मिरा|वीर|कपल|जोड़ा|दोनों|साथ|संग|एक दूसरे)": "[bgm:myra_love]",
-    
-    # ============ ACTION ============
-    r"(लड़ाई|संघर्ष|झगड़ा|मार|पिटाई|हमला|दंगा|युद्ध|विरोध)": "[sfx:punch]",
-    r"(आग|आग लगना|जलना|अग्नि|दहकना|प्रज्वलित)": "[sfx:fire]",
-    r"(विस्फोट|बम|फटना|धमाल|विस्फोटक|बिस्फोटन)": "[sfx:explosion]",
-    r"(तलवार|तलवार की आवाज़|ख़ंजर|शस्त्र|हथियार|काटना|पार करना)": "[sfx:sword_clash]",
-    r"(ऊर्जा किरण|शक्ति का विस्फोट|जादू|ताकत|शक्ति)": "[sfx:energy_blast]",
-    r"(धरती|जमीन|दरार|फटना|कंपन|झनझनाहट)": "[sfx:ground_crack]",
-    r"(मलबा|टुकड़े|उड़ना|भाग जाना|बिखरना)": "[sfx:flying_debris]",
-    
-    # ============ NAAGIN TRANSFORMATION (SIGNATURE SOUND) ============
-    r"(रूपांतर|बदल|नागिन बन|शक्ति जागृत|परिवर्तन|बदलाव|रूप बदल|मेटामॉर्फोसिस)": "[sfx:naagin_transform]",
-    r"(नागिन|नाग रूप|साँप का रूप|सर्प रूप|शक्तिशाली|जागृत)": "[sfx:naagin_transform]",
-    
-    # ============ NAAGMANI (ALWAYS SAME SOUND) ============
-    r"(नागमणि|मणि|रत्न|हीरा|जादुई|शक्तिशाली|अनमोल|अमूल्य)": "[sfx:naagmani_signature]",
-    
-    # ============ EMOTIONAL/SAD ============
-    r"(दुःख|गम|उदास|रुलाई|आँसू|दर्द|पीड़ा|तकलीफ|कष्ट|व्यथा)": "[bgm:emotional_sad]",
-    r"(अकेला|अकेली|अकेलेपन|अलग|दूर|विछोह|वियोग|बिछड़ना)": "[bgm:emotional_sad]",
-    r"(मृत्यु|मर|मरना|अंत|समाप्त|नष्ट|खत्म|जीवन)": "[bgm:emotional_sad]",
-    
-    # ============ FOREST ============
-    r"(जंगल|वन|वनस्पति|पेड़|पत्तियां|घास|वनचर|कानन|वनस्पति)": "[bgm:forest]",
-    r"(पक्षी|चिड़िया|कलरव|गीत|आवाज़|संगीत|चहचहाना)": "[sfx:forest_birds]",
-    r"(हवा|हवा का झोंका|बयार|सुगंध|ठंडक)": "[sfx:forest_wind]",
-    r"(नदी|जल|जलस्रोत|प्रवाह|गुड़गुड़ाहट)": "[sfx:river]",
-    r"(टिड्डी|टिड्डियों की आवाज़|रात|रात की आवाज़|छोटी आवाज़|गिड़गिड़ाहट)": "[sfx:crickets]",
-    r"(उल्लू|उल्लू की आवाज़|रात्रि|अंधेरा|शांति)": "[sfx:owl]",
-    
-    # ============ VILLAGE ============
-    r"(गाँव|ग्रामीण|देहाती|कस्बा|गाँव के|घर)": "[bgm:village]",
-    r"(गाय|गायों की आवाज़|पशु|गायब|डींक्ष|घंटी|मवेशी)": "[sfx:cow_bells]",
-    r"(बच्चे|बच्चों|खेल|खिलवाड़|हँसी|शोर|चहचहाहट)": "[sfx:children_voices]",
-    r"(बाज़ार|व्यापार|खरीद|बेच|दुकान|भीड़|लोग)": "[sfx:market_ambience]",
-    r"(पैर|चलना|कदम|पदचाप|आना|जाना|चलना फिरना)": "[sfx:footsteps]",
+    # --- पुराने साउंड्स ---
+    r"(हंसने|हंसा|मजाक|ठिठोली|खिलखिला)": "[sfx:laugh]",
+    r"(सांप|नाग|नागिन|फुंकार|डसने)": "[sfx:hiss]",
+    r"(बिजली|तूफान|बादल|गर्जना|कड़क)": "[sfx:thunder]",
+    r"(अचानक|चौंक|तभी|एकदम|पलक झपकते)": "[sfx:whoosh]",
+    r"(हवा|सन्नाटा|अंधेरा|जंगल|शमशान)": "[sfx:wind]",
+    r"(सोचा|बुद्धि|विचार|आइडिया|तरकीब)": "[sfx:ding]",
+
+    # --- नए साउंड्स (SFX) ---
+    r"(रोने|रोया|आंसू|सिसकने|विलाप|रोना)": "[sfx:crying]",
+    r"(डर|कांप|सहमा|खौफ|भयानक|भूत)": "[sfx:fear]",
+    r"(हांफने|हांफा|सांस फूल|थक)": "[sfx:panting]",
+    r"(शेर|दहाड़|सिंह|वनराज)": "[sfx:lion_roar]",
+    r"(कुत्ता|भोंकने|भौ-भौ|श्वान)": "[sfx:dog_bark]",
+    r"(बिल्ली|म्याऊ|म्यॉंऊ)": "[sfx:cat_meow]",
+    r"(भेड़िया|हुआँ|चीख)": "[sfx:wolf_howl]",
+    r"(दर्द|कराहा|चोट|आह|उफ्)": "[sfx:pain_groan]",
+
+    # --- म्यूजिक ट्रैक्स (BGM) ---
+    r"(प्यार|मोहब्बत|सुंदर|रूप|खूबसूरत|रोमांटिक)": "[bgm:love]",
+    r"(भगवान|शिव|मंदिर|पूजा|प्रार्थना|भक्ति|आशीर्वाद)": "[bgm:devotional]",
+    r"(रहस्य|राज|सस्पेंस|छुपा|खोज)": "[bgm:suspense]",
 }
 
 
@@ -670,25 +521,15 @@ def _align_cues_to_audio(text: str, boundaries: list, cues: list):
     return cues
 
 
-def mix_scene_audio(narration_input, cues, output_path, scene_duration):
+def mix_scene_audio(narration_path: str, cues: list, output_path: str, scene_duration: float):
     """Layer any detected SFX/BGM cues on top of the narration for one scene.
-    
-    narration_input: either a file path (str) or an AudioFileClip object
     SFX play as a short accent right at the cue's timestamp; BGM plays quietly
     from the cue's timestamp to the end of the scene. Cues whose sound file
     hasn't been added to sound_library/ yet are silently skipped (detection
     still ran — the audio just isn't there yet). Returns the path to use for
     this scene: the mixed file if anything was layered in, otherwise the
     original narration path unchanged."""
-    
-    # Handle both clip and path inputs
-    if isinstance(narration_input, str):
-        narration_clip = AudioFileClip(narration_input)
-        close_narration = True
-    else:
-        narration_clip = narration_input
-        close_narration = False
-    
+    narration_clip = AudioFileClip(narration_path)
     layers = [narration_clip]
     extra_clips = []  # sfx/bgm clips, closed separately from narration
 
@@ -721,24 +562,14 @@ def mix_scene_audio(narration_input, cues, output_path, scene_duration):
         extra_clips.append(raw_clip)
 
     if len(layers) == 1:
-        # No SFX/BGM to mix
-        if isinstance(narration_input, str):
-            # Input was a file path — just return it (already exists on disk)
-            if close_narration:
-                narration_clip.close()
-            return narration_input
-        else:
-            # Input was a clip — write it to output_path then close
-            narration_clip.write_audiofile(output_path, fps=44100, logger=None)
-            narration_clip.close()  # Always close, whether close_narration flag or not
-            return output_path
+        narration_clip.close()
+        return narration_path  # nothing found to layer in — reuse as-is
 
     composite = CompositeAudioClip(layers)
-    # Use a small epsilon to avoid floating-point precision issues
-    composite = _with_duration(composite, min(scene_duration, narration_clip.duration + 0.1))
+    composite = _with_duration(composite, scene_duration)
     composite.write_audiofile(output_path, fps=44100, logger=None)
     composite.close()
-    narration_clip.close()  # Always close — either we opened it from a path, or it's a clip we're done with
+    narration_clip.close()
     for c in extra_clips:
         try:
             c.close()
@@ -749,241 +580,53 @@ def mix_scene_audio(narration_input, cues, output_path, scene_duration):
 
 async def generate_all_audio(story_items, scene_voices, scene_styles, progress_callback=None):
     """
-    Generate TTS audio for every scene. Each scene can have multiple dialogue slots
-    (speaker 1 voice + text, speaker 2 voice + text, etc.), and they're concatenated
-    in sequence. Auto-detect + mix in SFX/BGM across the entire concatenated audio
-    for that scene.
+    Generate TTS audio sequentially for every (image_path, text) pair, then
+    auto-detect and mix in any SFX/BGM cues found in that scene's text.
 
-    story_items: list of (image_path, [slot1, slot2, ...])
-      where each slot is {"text": "...", "voice": "...", "rate": "...", "pitch": "..."}
-    scene_voices: NOT USED in this version (each slot has its own voice)
-    scene_styles: NOT USED in this version (each slot has its own rate/pitch)
+    scene_voices: list of voice IDs, one per scene (per-scene voice choice).
+    scene_styles: list of (rate, pitch) tuples, one per scene.
 
-    Returns (audio_paths, scene_cues) — audio_paths aligned with story_items order
-    (ready to hand straight to build_video), and scene_cues (the detected cues
-    per scene, for showing the user what was auto-added).
+    Returns (audio_paths, scene_cues) — audio_paths aligned with story_items
+    order (ready to hand straight to build_video), and scene_cues (the
+    detected cues per scene, for showing the user what was auto-added).
     """
     audio_paths = []
     scene_cues = []
     total = len(story_items)
+    for index, (_, text) in enumerate(story_items):
+        voice = scene_voices[index]
+        rate, pitch = scene_styles[index]
+        raw_audio_path = os.path.join(TEMP_DIR, f"audio_raw_{index}.mp3")
+        boundaries = await generate_audio_file(text, voice, raw_audio_path, rate=rate, pitch=pitch)
 
-    for index, (_, slots) in enumerate(story_items):
-        # Generate a separate TTS file for each dialogue slot
-        slot_audios = []
-        slot_boundaries = []
-        combined_text = ""  # concatenate all slot texts for cue detection
+        cues = find_sound_cues(text)
+        _align_cues_to_audio(text, boundaries, cues)
+        scene_cues.append(cues)
 
-        for slot_index, slot in enumerate(slots):
-            text = slot.get("text", "").strip()
-            if not text:
-                continue
+        with AudioFileClip(raw_audio_path) as probe:
+            scene_duration = probe.duration
 
-            voice = slot.get("voice", "")
-            rate = slot.get("rate", "+0%")
-            pitch = slot.get("pitch", "+0Hz")
-
-            raw_audio_path = os.path.join(TEMP_DIR, f"audio_raw_{index}_slot{slot_index}.mp3")
-            boundaries = await generate_audio_file(text, voice, raw_audio_path, rate=rate, pitch=pitch)
-            slot_audios.append(raw_audio_path)
-            slot_boundaries.append((text, boundaries))
-            combined_text += text + " "
-
-        # Concatenate all slot audios into one scene audio
-        if slot_audios:
-            mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
-            slot_clips = [AudioFileClip(p) for p in slot_audios]
-            concatenated = concatenate_audioclips(slot_clips)
-            scene_duration = concatenated.duration
-
-            # Detect cues in the COMBINED text and align them to the concatenated audio
-            cues = find_sound_cues(combined_text)
-            # Simple alignment: assume cues appear proportionally across the combined duration
-            if combined_text and cues:
-                text_len = len(combined_text)
-                for cue in cues:
-                    ratio = cue["start"] / text_len
-                    cue["audio_time"] = ratio * scene_duration
-            scene_cues.append(cues)
-
-            # Mix in SFX/BGM (pass clip directly to avoid temp file precision issues)
-            mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
-            final_path = mix_scene_audio(concatenated, cues, mixed_path, scene_duration)
-            # concatenated clip is now closed by mix_scene_audio, so don't close it again
-            for clip in slot_clips:
-                clip.close()
-            audio_paths.append(final_path)
-        else:
-            # No non-empty slots — create a silent 2-second audio placeholder
-            # (build_video still needs something to work with)
-            silent_path = os.path.join(TEMP_DIR, f"audio_silent_{index}.mp3")
-            try:
-                # Try MoviePy 2.x method
-                from moviepy.audio.AudioClip import AudioClip
-                silent_clip = AudioClip.make_silence(2.0, fps=44100, nchannels=2)
-            except (TypeError, AttributeError):
-                # Fall back to 1.x method
-                from moviepy.audio.AudioClip import AudioClip
-                silent_clip = AudioClip(lambda t: np.zeros((2,)), duration=2.0, fps=44100)
-            silent_clip.write_audiofile(silent_path, fps=44100, logger=None)
-            silent_clip.close()
-            audio_paths.append(silent_path)
-            scene_cues.append([])
+        mixed_path = os.path.join(TEMP_DIR, f"audio_{index}.mp3")
+        final_path = mix_scene_audio(raw_audio_path, cues, mixed_path, scene_duration)
+        audio_paths.append(final_path)
 
         if progress_callback:
             progress_callback((index + 1) / total, f"Generating audio {index + 1}/{total}...")
-
     return audio_paths, scene_cues
 
 
 def build_video(story_items, audio_paths, progress_callback=None, motion_effect="random",
-                 motion_prompts=None, fal_key=None, video_audio_volumes=None, video_speeds=None):
+                 motion_prompts=None, fal_key=None):
     """
-    Build the final video by pairing each image/video with its corresponding audio clip.
+    Build the final video by pairing each image with its corresponding audio clip.
+    motion_effect:
+      "none"      -> static image (original behavior)
+      "random"/"zoom_in"/etc. -> Ken Burns pan/zoom (camera motion only)
+      "ai_motion" -> full AI-generated motion + lip-sync via fal.ai (LTX-2.3 + LatentSync)
+                     Falls back to Ken Burns for any picture where generation fails,
+                     so one bad/slow API call doesn't kill the whole video.
+    Returns the path to the exported video file.
     """
-    if video_audio_volumes is None:
-        video_audio_volumes = []
-    if video_speeds is None:
-        video_speeds = []
-    
-    print(f"DEBUG: build_video called with {len(story_items)} scenes")
-    print(f"DEBUG: video_speeds = {video_speeds}")
-    
-    clips = []
-    image_clips_to_close = []
-    audio_clips_to_close = []
-    
-    for index, (image_path, dialogue_slots, *_) in enumerate(story_items):
-        audio_path = audio_paths[index]
-        
-        # Get video speed for this scene
-        video_speed = video_speeds[index] if video_speeds and index < len(video_speeds) else 1.0
-        
-        # Get narration duration
-        if audio_path and os.path.exists(audio_path):
-            with AudioFileClip(audio_path) as probe:
-                narration_duration = probe.duration
-        else:
-            narration_duration = 5.0
-        
-        print(f"DEBUG: Scene {index}: audio_path={audio_path}, speed={video_speed}x, narration={narration_duration:.2f}s")
-        
-        # ===== VIDEO CLIP CASE =====
-        if is_video_file(image_path):
-            print(f"✓ Video detected for scene {index}")
-            raw_clip = VideoFileClip(image_path)
-            image_clips_to_close.append(raw_clip)
-            
-            original_duration = raw_clip.duration
-            print(f"  Original video duration: {original_duration:.2f}s")
-            
-            # Apply speed using _multiply_speed (RELIABLE across MoviePy versions)
-            if video_speed != 1.0:
-                segment_clip = _multiply_speed(raw_clip, video_speed)
-                actual_duration = segment_clip.duration
-                print(f"  ✓ Speed {video_speed}x applied: {original_duration:.2f}s → {actual_duration:.2f}s")
-            else:
-                segment_clip = raw_clip
-                actual_duration = original_duration
-            
-            # Pad or loop to match narration
-            if actual_duration < narration_duration:
-                # Loop video to match narration duration
-                loops_needed = int(narration_duration // actual_duration) + 1
-                segment_clip = concatenate_videoclips([segment_clip] * loops_needed, method="compose")
-                image_clips_to_close.append(segment_clip)
-                duration = narration_duration
-                print(f"  Looped {loops_needed}x to match {narration_duration:.2f}s")
-            else:
-                duration = actual_duration
-                print(f"  No looping needed: {actual_duration:.2f}s ≥ {narration_duration:.2f}s")
-            
-            # Handle audio
-            original_audio = segment_clip.audio
-            video_vol = (
-                video_audio_volumes[index]
-                if video_audio_volumes and index < len(video_audio_volumes)
-                else ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME
-            )
-            
-            # If no narration audio was generated, use video's original audio
-            if audio_path and os.path.exists(audio_path):
-                narration_clip = AudioFileClip(audio_path)
-                # Mix video's original audio + narration
-                if original_audio is not None and video_vol > 0:
-                    dynamic_video_audio = _video_audio_with_dynamic_volume(
-                        original_audio, narration_duration, duration, video_vol
-                    )
-                    narration_boosted = _with_volume(narration_clip, NARRATION_VOLUME_WHEN_MIXED)
-                    combined_audio = CompositeAudioClip([dynamic_video_audio, narration_boosted])
-                    combined_audio = _pad_audio_with_silence(combined_audio, duration)
-                    segment_clip = _with_audio(segment_clip, combined_audio)
-                    audio_clips_to_close.append(combined_audio)
-                else:
-                    # No video audio, just use narration
-                    narration_padded = _pad_audio_with_silence(narration_clip, duration)
-                    segment_clip = _with_audio(segment_clip, narration_padded)
-                audio_clips_to_close.append(narration_clip)
-            else:
-                # No narration provided - use video's original audio if available
-                if original_audio is not None:
-                    print(f"  No narration - using video's original audio")
-                    segment_clip = segment_clip  # Keep existing audio
-                else:
-                    print(f"  No narration and no video audio - video will be silent")
-            
-            clips.append(segment_clip)
-        
-        # ===== IMAGE CLIP CASE (Ken Burns) =====
-        else:
-            print(f"✓ Image detected for scene {index}")
-            image_clip = ImageClip(image_path)
-            
-            # Apply Ken Burns effect
-            kb_clip = apply_ken_burns(image_clip, narration_duration, effect=motion_effect)
-            image_clips_to_close.append(kb_clip)
-            
-            # Apply speed adjustment
-            if video_speed != 1.0:
-                segment_clip = _multiply_speed(kb_clip, video_speed)
-                segment_clip = _with_duration(segment_clip, narration_duration)
-                print(f"  Speed {video_speed}x applied to Ken Burns clip")
-            else:
-                segment_clip = kb_clip
-            
-            # Attach audio
-            if audio_path and os.path.exists(audio_path):
-                narration_clip = AudioFileClip(audio_path)
-                narration_padded = _pad_audio_with_silence(narration_clip, narration_duration)
-                segment_clip = _with_audio(segment_clip, narration_padded)
-                audio_clips_to_close.append(narration_clip)
-            
-            clips.append(segment_clip)
-    
-    if not clips:
-        raise RuntimeError("No media elements generated.")
-    
-    print(f"✓ Building final video with {len(clips)} clips")
-    final_video = concatenate_videoclips(clips, method="compose")
-    
-    try:
-        final_video.write_videofile(
-            OUTPUT_FILENAME, fps=24, codec="libx264", audio_codec="aac",
-            remove_temp=True, verbose=False, logger=None
-        )
-    except TypeError:
-        final_video.write_videofile(
-            OUTPUT_FILENAME, fps=24, codec="libx264", audio_codec="aac",
-            remove_temp=True, logger=None
-        )
-    
-    final_video.close()
-    for c in clips:
-        try:
-            c.close()
-        except Exception:
-            pass
-    
-    return OUTPUT_FILENAME
     video_segments = []
     audio_clips_to_close = []
     image_clips_to_close = []
@@ -1000,121 +643,19 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
             segment_clip = None
 
             if is_video_file(image_path):
-                # User uploaded an actual video clip for this scene.
+                # User uploaded an actual video clip for this scene — use it
+                # as-is (looped or trimmed to match the narration length)
+                # instead of any Ken Burns / AI motion treatment.
                 raw_clip = VideoFileClip(image_path)
                 image_clips_to_close.append(raw_clip)
-                
-                original_duration = raw_clip.duration
-                original_fps = raw_clip.fps
-                
-                # Get speed from slider
-                video_speed = 1.0
-                if video_speeds and index < len(video_speeds):
-                    video_speed = video_speeds[index]
-                
-                print(f"DEBUG: Video {index} - Original: {original_duration:.2f}s @ {original_fps}fps, Speed: {video_speed}x")
-                
-                # Calculate expected duration after speed change
-                new_duration_after_speed = original_duration / video_speed
-                narration_duration = audio_clip.duration
-                
                 source_clip = raw_clip
-                
-                # Apply speed by changing FPS directly (more reliable than speedx)
-                if video_speed != 1.0:
-                    try:
-                        # Method 1: Try speedx() first
-                        source_clip = raw_clip.speedx(video_speed)
-                        actual_duration = source_clip.duration
-                        print(f"✓ speedx({video_speed}x) worked: {original_duration:.2f}s → {actual_duration:.2f}s")
-                    except:
-                        try:
-                            # Method 2: Change FPS directly
-                            # Lower FPS = slower playback
-                            # If speed is 0.5x, use half the FPS
-                            new_fps = original_fps * video_speed
-                            
-                            # Create a new clip with modified FPS
-                            source_clip = raw_clip.set_fps(new_fps)
-                            actual_duration = source_clip.duration
-                            print(f"✓ FPS method: {original_fps}fps → {new_fps}fps, duration: {original_duration:.2f}s → {actual_duration:.2f}s")
-                        except:
-                            try:
-                                # Method 3: Use speedx with inverted speed
-                                source_clip = raw_clip.speedx(1.0 / video_speed)
-                                actual_duration = source_clip.duration
-                                print(f"✓ Inverted speedx(1/{video_speed}x) worked: {original_duration:.2f}s → {actual_duration:.2f}s")
-                            except Exception as e:
-                                print(f"⚠ All speed methods failed: {e}")
-                                source_clip = raw_clip
-                                video_speed = 1.0
-                                actual_duration = original_duration
-                else:
-                    actual_duration = original_duration
-                    print(f"ℹ Video {index}: normal speed (1.0x)")
-
-                # Use actual duration from speedx, or calculated if it failed
-                video_duration = actual_duration if 'actual_duration' in locals() else new_duration_after_speed
-                
-                print(f"Final check: Video {video_duration:.2f}s vs Narration {narration_duration:.2f}s")
-
-                if video_duration >= narration_duration:
-                    # Video is long enough - NO LOOP
-                    duration = video_duration
-                    print(f"✓ NO LOOP: {video_duration:.2f}s ≥ {narration_duration:.2f}s")
-                else:
-                    # Video still short
-                    if video_speed == 1.0:
-                        # Normal speed - must loop
-                        loops_needed = int(narration_duration // original_duration) + 1
-                        print(f"ℹ LOOPING: speed=1.0x, loops needed={loops_needed}")
-                        looped = concatenate_videoclips([source_clip] * loops_needed, method="compose")
-                        image_clips_to_close.append(looped)
-                        source_clip = looped
-                        duration = narration_duration
-                    else:
-                        # Speed was applied but still short - don't loop
-                        duration = video_duration
-                        print(f"✓ NO LOOP (speed applied): {video_duration:.2f}s (will end before narration)")
-
-                # Use source_clip directly - if speedx() was applied, it has the correct duration
-                # Don't subclip because it will undo the speedx() effect
-                segment_clip = source_clip
-                segment_duration = segment_clip.duration  # Get the ACTUAL duration after speed adjustment
-                print(f"✓ Segment clip duration: {segment_duration:.2f}s (video_speed={video_speed}x)")
-
-                # Handle audio: narration + video's original audio
-                original_audio = segment_clip.audio  # None if the clip is silent
-                video_vol = (
-                    video_audio_volumes[index]
-                    if video_audio_volumes and index < len(video_audio_volumes)
-                    else ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME
-                )
-
-                # Pad or trim narration to match ACTUAL segment duration (after speed adjustment)
-                if narration_duration < segment_duration:
-                    # Video is longer → pad narration with silence at the end
-                    narration_to_mix = _pad_audio_with_silence(audio_clip, segment_duration)
-                    print(f"✓ Padded audio from {narration_duration:.2f}s to {segment_duration:.2f}s")
-                else:
-                    # Narration is same or longer → trim to segment duration
-                    narration_to_mix = _subclip(audio_clip, 0, segment_duration)
-                    print(f"ℹ Trimmed audio from {narration_duration:.2f}s to {segment_duration:.2f}s")
-
-                if original_audio is not None and video_vol > 0:
-                    # Mix video's original audio + narration
-                    dynamic_video_audio = _video_audio_with_dynamic_volume(
-                        original_audio, narration_duration, segment_duration, video_vol
-                    )
-                    narration_boosted = _with_volume(narration_to_mix, NARRATION_VOLUME_WHEN_MIXED)
-                    combined_audio = CompositeAudioClip([dynamic_video_audio, narration_boosted])
-                    combined_audio = _pad_audio_with_silence(combined_audio, segment_duration)
-                    segment_clip = _with_audio(segment_clip, combined_audio)
-                    audio_clips_to_close.append(combined_audio)
-                else:
-                    # No video audio, just attach narration (already padded if necessary)
-                    segment_clip = _with_audio(segment_clip, narration_to_mix)
-
+                if raw_clip.duration < duration:
+                    loops_needed = int(duration // raw_clip.duration) + 1
+                    looped_clip = concatenate_videoclips([raw_clip] * loops_needed, method="compose")
+                    image_clips_to_close.append(looped_clip)
+                    source_clip = looped_clip
+                segment_clip = _subclip(source_clip, 0, duration)
+                segment_clip = _with_audio(segment_clip, audio_clip)
                 image_clips_to_close.append(segment_clip)
                 video_segments.append(segment_clip)
                 if progress_callback:
@@ -1387,127 +928,59 @@ def main():
                 st.session_state[f"scene_rate_{scene_index}"] = rate
                 st.session_state[f"scene_pitch_{scene_index}"] = pitch
 
-        def _apply_slot_voice_preset(scene_index, slot_idx):
-            preset_name = st.session_state.get(f"slot_style_preset_{scene_index}_{slot_idx}")
-            if preset_name in VOICE_STYLE_PRESETS:
-                rate, pitch = VOICE_STYLE_PRESETS[preset_name]
-                st.session_state[f"slot_rate_{scene_index}_{slot_idx}"] = rate
-                st.session_state[f"slot_pitch_{scene_index}_{slot_idx}"] = pitch
-
-        # One scene per row: thumbnail/video + 2-3 dialogue slots
-        # Each slot = one speaker with text, voice, optional rate/pitch
-        NUM_DIALOGUE_SLOTS = 3
+        # One row per scene: thumbnail/video preview + its own text area, voice,
+        # style, and a live preview of any sound cues auto-detected in the text.
         for index, uploaded_file in enumerate(uploaded_images):
-            st.subheader(f"Scene {index + 1}: {uploaded_file.name}")
-            col_media, col_dialogue = st.columns([1, 3])
-
-            with col_media:
+            col1, col2 = st.columns([1, 2])
+            with col1:
                 if is_video_file(uploaded_file.name):
                     st.video(uploaded_file)
-                    st.caption(f"🎬 Video clip")
+                    st.caption(f"🎬 {uploaded_file.name} (video clip)")
                 else:
                     st.image(uploaded_file, caption=uploaded_file.name, use_container_width=True)
-                if is_video_file(uploaded_file.name):
-                    st.slider(
-                        "🔊 Original video sound level", 0.0, 1.0,
-                        ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME, step=0.05,
-                        key=f"scene_video_audio_vol_{index}",
-                        help="How loud this clip's own audio plays under your narration. "
-                             "0 = mute the clip's audio, 1 = full volume. Narration stays prioritized.",
+            with col2:
+                st.text_area(
+                    f"Story text for scene {index + 1}",
+                    key=f"story_text_{index}",
+                    height=120,
+                    placeholder="Write or paste the sentence that goes with this scene...",
+                )
+
+                scene_voice_label = st.selectbox(
+                    f"Voice for scene {index + 1}",
+                    options=voice_labels,
+                    index=default_voice_index,
+                    key=f"scene_voice_label_{index}",
+                )
+
+                with st.expander("🎙️ Fine-tune expressiveness (optional)"):
+                    st.caption("Push rate/pitch for a more animated, 'vocal' delivery on dramatic lines.")
+                    st.selectbox(
+                        "Style preset",
+                        options=list(VOICE_STYLE_PRESETS.keys()),
+                        key=f"scene_style_preset_{index}",
+                        on_change=_apply_voice_preset,
+                        args=(index,),
                     )
-                    st.slider(
-                        "▶️ Video speed", 0.25, 2.0, 1.0, step=0.25,
-                        key=f"scene_video_speed_{index}",
-                        help="Slow down (0.25–0.75) or speed up (1.25–2.0) this video clip. "
-                             "1.0 = normal speed.",
-                    )
+                    st.slider("Speaking rate", -50, 50, 0, step=5, key=f"scene_rate_{index}",
+                               help="Negative = slower/more dramatic, positive = faster/more excited")
+                    st.slider("Pitch", -50, 50, 0, step=5, key=f"scene_pitch_{index}",
+                               help="Negative = deeper, positive = higher/brighter")
 
-            with col_dialogue:
-                st.caption("Add up to 3 speakers for this scene — each with their own voice and text.")
-                dialogue_slots = []
-                for slot_idx in range(NUM_DIALOGUE_SLOTS):
-                    with st.expander(f"Speaker {slot_idx + 1}", expanded=(slot_idx == 0)):
-                        slot_text = st.text_area(
-                            "Dialogue text",
-                            key=f"slot_text_{index}_{slot_idx}",
-                            height=80,
-                            placeholder="Leave empty to skip this speaker...",
-                        )
-
-                        slot_voice_label = st.selectbox(
-                            "Voice",
-                            options=voice_labels,
-                            index=default_voice_index,
-                            key=f"slot_voice_label_{index}_{slot_idx}",
-                        )
-                        slot_voice = voice_options.get(slot_voice_label, selected_voice)
-
-                        with st.expander("⚙️ Style (optional)", expanded=False):
-                            st.selectbox(
-                                "Style preset",
-                                options=list(VOICE_STYLE_PRESETS.keys()),
-                                key=f"slot_style_preset_{index}_{slot_idx}",
-                                on_change=_apply_slot_voice_preset,
-                                args=(index, slot_idx),
-                            )
-                            st.slider("Speaking rate", -50, 50, 0, step=5,
-                                     key=f"slot_rate_{index}_{slot_idx}",
-                                     help="Negative = slower, positive = faster")
-                            st.slider("Pitch", -50, 50, 0, step=5,
-                                     key=f"slot_pitch_{index}_{slot_idx}",
-                                     help="Negative = deeper, positive = higher")
-
-                        if slot_text.strip():  # Only include non-empty slots
-                            rate_pct = st.session_state.get(f"slot_rate_{index}_{slot_idx}", 0)
-                            pitch_hz = st.session_state.get(f"slot_pitch_{index}_{slot_idx}", 0)
-                            dialogue_slots.append({
-                                "text": slot_text.strip(),
-                                "voice": slot_voice,
-                                "rate": f"{rate_pct:+d}%",
-                                "pitch": f"{pitch_hz:+d}Hz",
-                            })
-
-                        # Live preview of detected sounds for this slot
-                        scene_cues_preview = find_sound_cues(slot_text) if slot_text.strip() else []
-                        if scene_cues_preview:
-                            bits = []
-                            seen = set()
-                            for cue in scene_cues_preview:
-                                key = (cue["kind"], cue["name"])
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                icon = "🎵" if cue["kind"] == "bgm" else "🔊"
-                                has_file = sound_file_path(cue["kind"], cue["name"]) is not None
-                                bits.append(f"{icon} {cue['name']}" if has_file else f"{icon} {cue['name']} ⚠️")
-                            st.caption("Auto-detected sounds: " + " · ".join(bits))
-
-                # Collect dialogue slots for this scene EXPLICITLY
-                dialogue_slots = []
-                for slot_idx in range(NUM_DIALOGUE_SLOTS):
-                    slot_text_key = f"slot_text_{index}_{slot_idx}"
-                    slot_text = st.session_state.get(slot_text_key, "").strip()
-                    
-                    if slot_text:  # Only include non-empty slots
-                        slot_voice_key = f"slot_voice_label_{index}_{slot_idx}"
-                        slot_voice_label = st.session_state.get(slot_voice_key, default_voice_label)
-                        slot_voice = voice_options.get(slot_voice_label, selected_voice)
-                        
-                        rate_pct = st.session_state.get(f"slot_rate_{index}_{slot_idx}", 0)
-                        pitch_hz = st.session_state.get(f"slot_pitch_{index}_{slot_idx}", 0)
-                        
-                        dialogue_slots.append({
-                            "text": slot_text,
-                            "voice": slot_voice,
-                            "rate": f"{rate_pct:+d}%",
-                            "pitch": f"{pitch_hz:+d}Hz",
-                        })
-
-                # Store the dialogue slots for this scene
-                st.session_state[f"scene_dialogue_{index}"] = dialogue_slots if dialogue_slots else [
-                    {"text": "", "voice": selected_voice, "rate": "+0%", "pitch": "+0Hz"}
-                ]
-
+                scene_text = st.session_state.get(f"story_text_{index}", "")
+                scene_cues_preview = find_sound_cues(scene_text) if scene_text.strip() else []
+                if scene_cues_preview:
+                    bits = []
+                    seen = set()
+                    for cue in scene_cues_preview:
+                        key = (cue["kind"], cue["name"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        icon = "🎵" if cue["kind"] == "bgm" else "🔊"
+                        has_file = sound_file_path(cue["kind"], cue["name"]) is not None
+                        bits.append(f"{icon} {cue['name']}" if has_file else f"{icon} {cue['name']} ⚠️ no file yet")
+                    st.caption("Auto-detected sounds: " + " · ".join(bits))
             st.divider()
 
     st.subheader("5️⃣ Motion Effect")
@@ -1595,15 +1068,10 @@ def main():
             st.error("❌ Please upload at least one picture before generating the video.")
             return
 
-        # Check if each scene has at least ONE speaker with text (multi-dialogue slots)
-        missing_text_indexes = []
-        for i in range(len(uploaded_images)):
-            scene_dialogue = st.session_state.get(f"scene_dialogue_{i}", [])
-            # Filter out empty slots
-            has_text = any(slot.get("text", "").strip() for slot in scene_dialogue)
-            if not has_text:
-                missing_text_indexes.append(i)
-
+        missing_text_indexes = [
+            i for i in range(len(uploaded_images))
+            if not st.session_state.get(f"story_text_{i}", "").strip()
+        ]
         if missing_text_indexes:
             missing_names = ", ".join(
                 uploaded_images[i].name for i in missing_text_indexes
@@ -1623,31 +1091,28 @@ def main():
             with st.spinner("Setting up workspace..."):
                 setup_workspace()
                 story_items = []
-                video_audio_volumes = []
-                video_speeds = []
+                scene_voices = []
+                scene_styles = []
                 for index, uploaded_file in enumerate(uploaded_images):
                     image_path = save_uploaded_media(uploaded_file)
-                    # Get the multi-slot dialogue for this scene
-                    dialogue_slots = st.session_state.get(f"scene_dialogue_{index}", [])
-                    story_items.append((image_path, dialogue_slots))
+                    text = st.session_state[f"story_text_{index}"].strip()
+                    story_items.append((image_path, text))
 
-                    if is_video_file(uploaded_file.name):
-                        vol = st.session_state.get(f"scene_video_audio_vol_{index}", ORIGINAL_VIDEO_AUDIO_DEFAULT_VOLUME)
-                        video_audio_volumes.append(vol)
-                        speed = st.session_state.get(f"scene_video_speed_{index}", 1.0)
-                        video_speeds.append(speed)
-                    else:
-                        video_audio_volumes.append(0)  # not a video, doesn't matter
-                        video_speeds.append(1.0)  # no speed change for images
+                    scene_voice_label = st.session_state.get(f"scene_voice_label_{index}", default_voice_label)
+                    scene_voices.append(voice_options.get(scene_voice_label, selected_voice))
 
-            # Audio generation now handles multiple dialogue slots per scene
+                    rate_pct = st.session_state.get(f"scene_rate_{index}", 0)
+                    pitch_hz = st.session_state.get(f"scene_pitch_{index}", 0)
+                    scene_styles.append((f"{rate_pct:+d}%", f"{pitch_hz:+d}Hz"))
+
+            # ---------------- Audio Generation (+ auto SFX/BGM mixing) ----------------
             audio_progress = st.progress(0, text="Starting audio generation...")
 
             def audio_progress_callback(fraction, message):
                 audio_progress.progress(fraction, text=message)
 
             audio_paths, scene_cues = asyncio.run(
-                generate_all_audio(story_items, None, None, audio_progress_callback)
+                generate_all_audio(story_items, scene_voices, scene_styles, audio_progress_callback)
             )
             audio_progress.progress(1.0, text="Audio generation complete ✅")
 
@@ -1685,8 +1150,6 @@ def main():
                     motion_effect=selected_motion_effect,
                     motion_prompts=motion_prompts,
                     fal_key=fal_key_input,
-                    video_audio_volumes=video_audio_volumes,
-                    video_speeds=video_speeds,
                 )
 
             video_progress.progress(1.0, text="Video assembly complete ✅")
