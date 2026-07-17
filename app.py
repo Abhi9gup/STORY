@@ -485,17 +485,17 @@ async def generate_all_audio(story_items, progress_callback=None):
     return audio_paths, scene_cues
 
 # --------------------------------------------------------------------------
-# Uniform Dimensions Video Generation Fix
+# Video Compiling Engine (Aspect Normalization + Audio Ducking Execution)
 # --------------------------------------------------------------------------
 def build_video(story_items, audio_paths, progress_callback=None, motion_effect="random",
-                motion_prompts=None, fal_key=None):
+                motion_prompts=None, fal_key=None, video_duck_volume=0.20):
     video_segments = []
     audio_clips_to_close = []
     image_clips_to_close = []
     ai_generated_paths = []
     total = len(story_items)
     
-    # Force a standard uniform resolution canvas (Standard Full HD Widescreen)
+    # Standard Widescreen Full HD Resolution
     TARGET_SIZE = (1920, 1080)  
     
     try:
@@ -510,27 +510,45 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 raw_clip = VideoFileClip(image_path)
                 image_clips_to_close.append(raw_clip)
 
+                scene_duration = max(raw_clip.duration, duration)
+                
+                # Dynamic Audio Ducking Pipeline
+                if raw_clip.audio is not None:
+                    audio_layers = []
+                    
+                    # Layer 1: Narration Voice track (Always 100% volume)
+                    narration_layer = _with_start(audio_clip, 0)
+                    audio_layers.append(narration_layer)
+                    
+                    # Layer 2: Original Background Track (Ducked during overlap, Full at the tail)
+                    if raw_clip.duration <= duration:
+                        ducked_video_audio = _with_volume(raw_clip.audio, video_duck_volume)
+                        audio_layers.append(ducked_video_audio)
+                    else:
+                        # Duck original audio while text narration runs
+                        overlap_audio = _subclip(raw_clip.audio, 0, duration)
+                        overlap_audio = _with_volume(overlap_audio, video_duck_volume)
+                        audio_layers.append(overlap_audio)
+                        
+                        # Return to 100% volume once text narration completes
+                        tail_audio = _subclip(raw_clip.audio, duration, raw_clip.duration)
+                        tail_audio = _with_start(tail_audio, duration)
+                        audio_layers.append(tail_audio)
+                    
+                    combined_audio = CompositeAudioClip(audio_layers)
+                    combined_audio = _with_duration(combined_audio, scene_duration)
+                else:
+                    combined_audio = _with_duration(audio_clip, scene_duration)
+
                 if raw_clip.duration <= duration:
                     loops_needed = int(duration // raw_clip.duration) + 1
                     looped_clip = concatenate_videoclips([raw_clip] * loops_needed, method="compose")
                     image_clips_to_close.append(looped_clip)
                     segment_clip = _subclip(looped_clip, 0, duration)
-                    segment_clip = _with_audio(segment_clip, audio_clip)
                 else:
-                    scene_duration = raw_clip.duration
-                    narration_layer = _with_start(audio_clip, 0)
-                    audio_layers = [narration_layer]
-                    tail_duration = scene_duration - duration
-                    if raw_clip.audio is not None and tail_duration > 0.05:
-                        tail_audio = _subclip(raw_clip.audio, duration, scene_duration)
-                        tail_audio = _with_start(tail_audio, duration)
-                        audio_layers.append(tail_audio)
-                    combined_audio = (
-                        CompositeAudioClip(audio_layers) if len(audio_layers) > 1 else narration_layer
-                    )
-                    combined_audio = _with_duration(combined_audio, scene_duration)
-                    segment_clip = _with_audio(raw_clip, combined_audio)
-
+                    segment_clip = raw_clip
+                
+                segment_clip = _with_audio(segment_clip, combined_audio)
                 image_clips_to_close.append(segment_clip)
 
             elif motion_effect == "ai_motion":
@@ -572,7 +590,7 @@ def build_video(story_items, audio_paths, progress_callback=None, motion_effect=
                 image_clips_to_close.append(image_clip)
                 segment_clip = image_clip
 
-            # Normalize dimensions by resizing and cropping the segment down to target dimensions
+            # Dimensions normalizer centering crop steps
             if hasattr(segment_clip, "cropped"):
                 segment_clip = segment_clip.cropped(width=TARGET_SIZE[0], height=TARGET_SIZE[1])
             elif hasattr(segment_clip, "crop"):
@@ -766,7 +784,7 @@ def main():
                             f"Line {line_i + 1} — scene {index + 1}",
                             key=f"story_text_{index}_{line_i}",
                             height=90,
-                            placeholder=("e.g. राम ने कहा, 'चलो चलते हैं'" if line_i > 0 or num_lines > 1 else "Write story sentence here..."),
+                            placeholder=("e.g. राम ने कहा, 'चلو चलते हैं'" if line_i > 0 or num_lines > 1 else "Write story sentence here..."),
                         )
                     with line_cols[1]:
                         st.selectbox(
@@ -815,7 +833,7 @@ def main():
                     st.caption("Auto-detected sounds: " + " · ".join(bits))
             st.divider()
 
-    st.subheader("5️⃣ Motion Effect")
+    st.subheader("5️⃣ Motion Effect & Audio Mixing Control")
     motion_choice = st.selectbox(
         "Motion style",
         options=[
@@ -842,6 +860,14 @@ def main():
         "None (static, original behavior)": "none",
     }
     selected_motion_effect = motion_effect_map[motion_choice]
+    
+    st.caption("🔊 Ducking Mix Levels")
+    video_duck_volume = st.slider(
+        "Video's original background voice loudness while text narration is playing",
+        min_value=0, max_value=100, value=20, step=5,
+        help="0% means completely muted during text audio; 100% means full volume mixed together."
+    ) / 100.0
+
     fal_key_input = ""
     motion_prompts = {}
     if selected_motion_effect == "ai_motion":
@@ -914,7 +940,8 @@ def main():
             with st.spinner("Compiling final video... this may take a moment."):
                 output_path = build_video(
                     story_items, audio_paths, lambda f, m: video_progress.progress(f, text=m),
-                    motion_effect=selected_motion_effect, motion_prompts=motion_prompts, fal_key=fal_key_input
+                    motion_effect=selected_motion_effect, motion_prompts=motion_prompts, fal_key=fal_key_input,
+                    video_duck_volume=video_duck_volume
                 )
             video_progress.progress(1.0, text="Video assembly complete ✅")
 
